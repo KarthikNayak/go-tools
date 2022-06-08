@@ -28,7 +28,6 @@ func main() {
 	cmd.AddAnalyzers(simple.Analyzers...)
 	cmd.AddAnalyzers(staticcheck.Analyzers...)
 	cmd.AddAnalyzers(stylecheck.Analyzers...)
-	cmd.AddAnalyzers(unused.Analyzer)
 	cmd.AddAnalyzers(unused2.Analyzer)
 
 	if *qf {

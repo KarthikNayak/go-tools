@@ -8,7 +8,7 @@ func fn1() bool { //@ used(false)
 	var v interface{} = t1{}
 	switch obj := v.(type) {
 	case interface {
-		fragment()
+		fragment() //@ used(false)
 	}:
 		obj.fragment()
 	}

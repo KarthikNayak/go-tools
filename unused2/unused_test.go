@@ -2,7 +2,9 @@ package unused2
 
 import (
 	"fmt"
+	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -36,6 +38,45 @@ type key struct {
 
 func (k key) String() string {
 	return fmt.Sprintf("%s:%d", k.file, k.line)
+}
+
+func relativePath(s string) string {
+	// This is only used in a test, so we don't care about failures, or the cost of repeatedly calling os.Getwd
+	cwd, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	s, err = filepath.Rel(cwd, s)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+func relativePosition(pos token.Position) string {
+	s := pos.Filename
+	if pos.IsValid() {
+		if s != "" {
+			// This is only used in a test, so we don't care about failures, or the cost of repeatedly calling os.Getwd
+			cwd, err := os.Getwd()
+			if err != nil {
+				panic(err)
+			}
+			s, err = filepath.Rel(cwd, s)
+			if err != nil {
+				panic(err)
+			}
+			s += ":"
+		}
+		s += fmt.Sprintf("%d", pos.Line)
+		if pos.Column != 0 {
+			s += fmt.Sprintf(":%d", pos.Column)
+		}
+	}
+	if s == "" {
+		s = "-"
+	}
+	return s
 }
 
 func check(t *testing.T, res *analysistest.Result) {
@@ -96,7 +137,7 @@ func check(t *testing.T, res *analysistest.Result) {
 			k := key{posn.Filename, posn.Line}
 			exp, ok := want[k]
 			if !ok {
-				t.Errorf("unexpected %s object %q at %s", state, obj, posn)
+				t.Errorf("object at %s shouldn't exist but is %s", relativePosition(posn), state)
 				continue
 			}
 			if false {
@@ -105,7 +146,7 @@ func check(t *testing.T, res *analysistest.Result) {
 			}
 			delete(want, k)
 			if state != exp {
-				t.Errorf("object at %s should be %s but is %s", posn, exp, state)
+				t.Errorf("object at %s should be %s but is %s", relativePosition(posn), exp, state)
 			}
 		}
 	}
@@ -120,7 +161,7 @@ func check(t *testing.T, res *analysistest.Result) {
 		} else {
 			exp = "unused"
 		}
-		t.Errorf("did not see expected %s object %s:%d", exp, key.file, key.line)
+		t.Errorf("object at %s:%d should be %s but wasn't seen", relativePath(key.file), key.line, exp)
 	}
 }
 

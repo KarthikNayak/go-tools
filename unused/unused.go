@@ -63,21 +63,12 @@ var Debug io.Writer
 - named types use:
   - [X] (2.1) exported methods
   - [X] (2.2) the type they're based on
-  - [ ] (2.3) all their aliases. we can't easily track uses of aliases
-    because go/types turns them into uses of the aliased types. assume
-    that if a type is used, so are all of its aliases.
-    ^ this will no longer be necessary with our AST-based rewrite
-  - [ ] (2.4) the pointer type. this aids with eagerly implementing
-    interfaces. if a method that implements an interface is defined on
-    a pointer receiver, and the pointer type is never used, but the
-    named type is, then we still want to mark the method as used.
-    ^ this will no longer be necessary with our AST-based rewrite
   - [X] (2.5) all their type parameters. Unused type parameters are probably useless, but they're a brand new feature and we
     don't want to introduce false positives because we couldn't anticipate some novel use-case.
   - [ ] (2.6) all their type arguments
 
 - variables and constants use:
-  - their types
+  - [X] their types
 
 - functions use:
   - [X] (4.1) all their arguments, return parameters and receivers
@@ -86,10 +77,9 @@ var Debug io.Writer
     this implements a simplified model where a function is used merely by being referenced, even if it is never called.
     that way we don't have to keep track of closures escaping functions.
   - [X] (4.4) functions they return. we assume that someone else will call the returned function
-  - [ ] (4.5) functions/interface methods they call
-  - [ ] (4.6) types they instantiate or convert to
+  - [X] (4.5) functions/interface methods they call
+  - [X] (4.6) types they instantiate or convert to
   - [X] (4.7) fields they access
-  - [ ] (4.8) types of all instructions
   - [X] (4.9) package-level variables they assign to iff in tests (sinks for benchmarks)
   - [X] (4.10) all their type parameters. See 2.5 for reasoning.
 
@@ -133,7 +123,6 @@ var Debug io.Writer
     used by 8.3 just because it contributes A's methods to C.
 
 - Inherent uses:
-  - thunks and other generated wrappers call the real function
   - (9.2) variables use their types
   - (9.3) types use their underlying and element types
   - (9.4) conversions use the type they convert to
