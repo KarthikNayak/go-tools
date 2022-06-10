@@ -19,6 +19,11 @@ import (
 	"honnef.co/go/tools/unused"
 )
 
+// TODO(dh): currently, types use methods that implement interfaces. However, this makes a method used even if the
+// relevant interface is never used. What if instead interfaces used those methods? Right now we cannot do that, because
+// methods use their receivers, so using a method uses the type. But do we need that edge? Is there a way to refer to a
+// method without explicitly mentioning the type somewhere? If not, the edge from method to receiver is superfluous.
+
 // XXX embedded fields that contribute exported methods or fields should be considered used (6.4 and 6.5)
 // XXX embedded exported types should be used, their name is exported
 
@@ -38,7 +43,6 @@ var Serialize = unused.Serialize
 var Implements = unused.Implements
 
 func debugf(f string, v ...interface{}) {
-	return
 	// XXX respect -debug.unused-graph flag for destination
 	fmt.Fprintf(os.Stdout, f, v...)
 }
@@ -206,23 +210,39 @@ func (g *graph) entry(pass *analysis.Pass) {
 		}
 	}
 
-	// (8.0) handle interfaces
-	for _, iface := range g.interfaceTypes {
-		// OPT(dh): (8.1) we only need interfaces that have unexported methods
-
-		for _, named := range g.namedTypes {
-			if _, ok := named.Type().Underlying().(*types.Interface); ok {
-				// We don't care about interfaces implementing interfaces; all their methods are already used, anyway
-				continue
+	processMethodSet := func(named *types.TypeName, ms *types.MethodSet) {
+		for i := 0; i < ms.Len(); i++ {
+			// (2.1) named types use exported methods
+			// (6.4) structs use embedded fields that have exported methods
+			//
+			// By reading the selection, we read all embedded fields that are part of the path
+			m := ms.At(i)
+			if token.IsExported(m.Obj().Name()) {
+				g.readSelection(m, named)
 			}
-			// OPT(dh): do we already have the method set available?
-			ms := types.NewMethodSet(named.Type())
-			if sels, ok := Implements(named.Type(), iface, ms); ok {
-				for _, sel := range sels {
-					g.use(sel.Obj(), named)
+		}
+
+		if _, ok := named.Type().Underlying().(*types.Interface); !ok {
+			// (8.0) handle interfaces
+			//
+			// We don't care about interfaces implementing interfaces; all their methods are already used, anyway
+			for _, iface := range g.interfaceTypes {
+				if sels, ok := Implements(named.Type(), iface, ms); ok {
+					for _, sel := range sels {
+						// (8.2) any concrete type implements all known interfaces
+						// (6.3) structs use embedded fields that help implement interfaces
+						g.readSelection(sel, named)
+					}
 				}
 			}
 		}
+	}
+
+	for _, named := range g.namedTypes {
+		// OPT(dh): do we already have the method set available?
+		processMethodSet(named, types.NewMethodSet(named.Type()))
+		processMethodSet(named, types.NewMethodSet(types.NewPointer(named.Type())))
+
 	}
 
 	// XXX handle ignore directives
@@ -347,7 +367,7 @@ func (g *graph) read(node ast.Node, by types.Object) {
 		g.read(node.Elt, by)
 
 	case *ast.SelectorExpr:
-		g.readSelectorPath(node, by)
+		g.readSelectorExpr(node, by)
 
 	case *ast.IndexExpr:
 		g.read(node.X, by)
@@ -398,11 +418,21 @@ func (g *graph) read(node ast.Node, by types.Object) {
 			return
 		}
 
+		// This branch is only hit for field lists enclosed by parentheses or square brackets, i.e. parameters. Fields
+		// (for structs) and method lists (for interfaces) are handled elsewhere.
+
 		for _, field := range node.List {
-			// XXX arguments and receivers can be unnamed
-			for _, name := range field.Names {
-				g.read(name, by)
-				g.read(field.Type, g.pass.TypesInfo.ObjectOf(name))
+			if len(field.Names) == 0 {
+				g.read(field.Type, by)
+			} else {
+				for _, name := range field.Names {
+					// OPT(dh): instead of by -> name -> type, we could just emit by -> type. We don't care about the
+					// (un)usedness of parameters of any kind.
+					obj := g.pass.TypesInfo.ObjectOf(name)
+					g.see(obj, by)
+					g.use(obj, by)
+					g.read(field.Type, obj)
+				}
 			}
 		}
 
@@ -415,15 +445,16 @@ func (g *graph) read(node ast.Node, by types.Object) {
 		for _, field := range node.Fields.List {
 			if len(field.Names) == 0 {
 				// embedded field
-				// XXX implement
 
-				// XXX how do we get the object for the field? embedded fields can be (pointers to) (qualified)
-				// (instantiated) identifiers. we'd rather not have to dig into the syntax.
+				f := g.embeddedField(field.Type)
+				g.use(f, by)
 			} else {
 				for _, name := range field.Names {
 					// (11.1) anonymous struct types use all their fields
-					g.see(g.pass.TypesInfo.ObjectOf(name), by)
-					g.read(name, by)
+					// OPT(dh): instead of by -> name -> type, we could just emit by -> type. If the type is used, then the fields are used.
+					obj := g.pass.TypesInfo.ObjectOf(name)
+					g.see(obj, by)
+					g.use(obj, by)
 					g.read(field.Type, g.pass.TypesInfo.ObjectOf(name))
 				}
 			}
@@ -534,7 +565,7 @@ func (g *graph) write(node ast.Node, by types.Object) {
 		g.read(node.X, by)
 
 	case *ast.SelectorExpr:
-		g.readSelectorPath(node, by)
+		g.readSelectorExpr(node, by)
 
 	case *ast.StarExpr:
 		g.read(node.X, by)
@@ -544,8 +575,8 @@ func (g *graph) write(node ast.Node, by types.Object) {
 	}
 }
 
-// readSelectorPath reads all elements of a selector expression, including implicit fields.
-func (g *graph) readSelectorPath(sel *ast.SelectorExpr, by types.Object) {
+// readSelectorExpr reads all elements of a selector expression, including implicit fields.
+func (g *graph) readSelectorExpr(sel *ast.SelectorExpr, by types.Object) {
 	// cover AST-based accesses
 	g.read(sel.X, by)
 
@@ -553,9 +584,12 @@ func (g *graph) readSelectorPath(sel *ast.SelectorExpr, by types.Object) {
 	if !ok {
 		return
 	}
+	g.readSelection(tsel, by)
+}
 
-	indices := tsel.Index()
-	base := tsel.Recv()
+func (g *graph) readSelection(sel *types.Selection, by types.Object) {
+	indices := sel.Index()
+	base := sel.Recv()
 	for _, idx := range indices[:len(indices)-1] {
 		// XXX do we need core types here?
 		field := typeutil.Dereference(base.Underlying()).Underlying().(*types.Struct).Field(idx)
@@ -563,7 +597,7 @@ func (g *graph) readSelectorPath(sel *ast.SelectorExpr, by types.Object) {
 		base = field.Type()
 	}
 
-	g.read(sel.Sel, by)
+	g.use(sel.Obj(), by)
 }
 
 func (g *graph) block(block *ast.BlockStmt, by types.Object) {
@@ -710,10 +744,6 @@ func (g *graph) decl(decl ast.Decl, by types.Object) {
 			if decl.Recv == nil {
 				// (1.2) packages use exported functions
 				g.use(obj, nil)
-			} else {
-				// (2.1) named types use exported methods
-				tname := typeutil.Dereference(g.pass.TypesInfo.TypeOf(decl.Recv.List[0].Type)).(*types.Named).Obj()
-				g.use(obj, tname)
 			}
 		} else if decl.Name.Name == "init" {
 			// (1.5) packages use init functions
@@ -725,6 +755,8 @@ func (g *graph) decl(decl ast.Decl, by types.Object) {
 
 		// (4.1) functions use all their arguments, return parameters and receivers
 		// (4.10) all their type parameters
+		// XXX we have to g.see the receiver
+		g.read(decl.Recv, obj)
 		g.read(decl.Type, obj)
 		g.block(decl.Body, obj)
 
@@ -942,9 +974,12 @@ func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
 		// Named structs are special in that its unexported fields are only used if they're being written to. That is,
 		// the fields are not used by the named type itself, nor are the types of the fields.
 		for _, field := range st.Fields.List {
-			// XXX fields can be unnamed
 			if len(field.Names) == 0 {
-				g.embeddedField(field.Type)
+				fieldVar := g.embeddedField(field.Type)
+				if hasExportedField(fieldVar.Type()) {
+					// (6.5) structs use embedded structs that have exported fields (recursively)
+					g.use(fieldVar, typ)
+				}
 			} else {
 				for _, name := range field.Names {
 					obj := g.pass.TypesInfo.ObjectOf(name)
@@ -964,6 +999,7 @@ func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
 					}
 				}
 			}
+
 		}
 	} else {
 		g.read(spec, typ)

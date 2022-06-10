@@ -93,7 +93,7 @@ var Debug io.Writer
 - structs use:
   - [X] (6.1) fields of type NoCopy sentinel
   - [X] (6.2) exported fields
-  - [ ] (6.3) embedded fields that help implement interfaces (either fully implements it, or contributes required methods) (recursively)
+  - [X] (6.3) embedded fields that help implement interfaces (either fully implements it, or contributes required methods) (recursively)
   - [ ] (6.4) embedded fields that have exported methods (recursively)
   - [ ] (6.5) embedded structs that have exported fields (recursively)
 
@@ -104,7 +104,7 @@ var Debug io.Writer
   - (8.1) We do not technically care about interfaces that only consist of
     exported methods. Exported methods on concrete types are always
     marked as used.
-  - Any concrete type implements all known interfaces. Even if it isn't
+  - [X] (8.2) Any concrete type implements all known interfaces. Even if it isn't
     assigned to any interfaces in our code, the user may receive a value
     of the type and expect to pass it back to us through an interface.
 
@@ -140,7 +140,7 @@ var Debug io.Writer
     Do not, however, include constants named _ in constant groups.
 
 
-- (11.1) anonymous struct types use all their fields. we cannot
+- [X] (11.1) anonymous struct types use all their fields. we cannot
   deduplicate struct types, as that leads to order-dependent
   reports. we can't not deduplicate struct types while still
   tracking fields, because then each instance of the unnamed type in
