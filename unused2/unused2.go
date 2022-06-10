@@ -38,6 +38,7 @@ var Serialize = unused.Serialize
 var Implements = unused.Implements
 
 func debugf(f string, v ...interface{}) {
+	return
 	// XXX respect -debug.unused-graph flag for destination
 	fmt.Fprintf(os.Stdout, f, v...)
 }
@@ -70,7 +71,8 @@ type graph struct {
 	nodeCounter uint64
 
 	// package-level named types
-	namedTypes []*types.TypeName
+	namedTypes     []*types.TypeName
+	interfaceTypes []*types.Interface
 }
 
 func (g *graph) newNode(obj types.Object) *node {
@@ -134,8 +136,10 @@ func (g *graph) see(obj, owner types.Object) {
 	// XXX use isIrrelevant
 
 	nObj := g.node(obj)
-	nOwner := g.node(owner)
-	nOwner.owns = append(nOwner.owns, nObj)
+	if owner != nil {
+		nOwner := g.node(owner)
+		nOwner.owns = append(nOwner.owns, nObj)
+	}
 }
 
 func ourIsIrrelevant(obj types.Object) bool {
@@ -203,21 +207,7 @@ func (g *graph) entry(pass *analysis.Pass) {
 	}
 
 	// (8.0) handle interfaces
-	seen := map[*types.Interface]struct{}{}
-	for _, tv := range pass.TypesInfo.Types {
-		iface, ok := tv.Type.Underlying().(*types.Interface)
-		if !ok {
-			continue
-		}
-		if iface.NumMethods() == 0 {
-			// There's no point in looking at the empty interface
-			continue
-		}
-		if _, ok := seen[iface]; ok {
-			continue
-		}
-		seen[iface] = struct{}{}
-
+	for _, iface := range g.interfaceTypes {
 		// OPT(dh): (8.1) we only need interfaces that have unexported methods
 
 		for _, named := range g.namedTypes {
@@ -431,6 +421,7 @@ func (g *graph) read(node ast.Node, by types.Object) {
 				// (instantiated) identifiers. we'd rather not have to dig into the syntax.
 			} else {
 				for _, name := range field.Names {
+					// (11.1) anonymous struct types use all their fields
 					g.see(g.pass.TypesInfo.ObjectOf(name), by)
 					g.read(name, by)
 					g.read(field.Type, g.pass.TypesInfo.ObjectOf(name))
@@ -443,9 +434,28 @@ func (g *graph) read(node ast.Node, by types.Object) {
 		g.read(node.Type, by)
 
 	case *ast.InterfaceType:
-		// This is only used for anonymous interface types, not named ones.
+		if len(node.Methods.List) != 0 {
+			g.interfaceTypes = append(g.interfaceTypes, g.pass.TypesInfo.TypeOf(node).(*types.Interface))
+		}
+		for _, meth := range node.Methods.List {
+			switch len(meth.Names) {
+			case 0:
+				// Embedded type or type union
+				// (8.4) all embedded interfaces are marked as used
+				// (this also covers type sets)
 
-		// XXX implement
+				g.read(meth.Type, by)
+			case 1:
+				// Method
+				// (8.3) all interface methods are marked as used
+				obj := g.pass.TypesInfo.ObjectOf(meth.Names[0])
+				g.see(obj, by)
+				g.use(obj, by)
+				g.read(meth.Type, obj)
+			default:
+				panic(fmt.Sprintf("unexpected number of names: %d", len(meth.Names)))
+			}
+		}
 
 	case *ast.Ellipsis:
 		g.read(node.Elt, by)
@@ -598,24 +608,33 @@ func (g *graph) decl(decl ast.Decl, by types.Object) {
 				}
 			}
 
-			// (10.1) if one constant out of a block of constants is used, mark all of them used
 			groups := astutil.GroupSpecs(g.pass.Fset, decl.Specs)
 			for _, group := range groups {
-				if len(group) > 1 {
-					for i, spec := range group[:len(group)-1] {
-						names := spec.(*ast.ValueSpec).Names
-						for j := range names[:len(names)-1] {
-							// names[j] uses names[j+1]
-							left := g.pass.TypesInfo.ObjectOf(names[j+1])
-							right := g.pass.TypesInfo.ObjectOf(names[j])
-							g.use(left, right)
-							g.use(right, left)
+				// (10.1) if one constant out of a block of constants is used, mark all of them used
+				//
+				// We encode this as a ring. If we have a constant group 'const ( a; b; c )', then we'll produce the
+				// following graph: a -> b -> c -> a.
+
+				var first, prev, last types.Object
+				for _, spec := range group {
+					for _, name := range spec.(*ast.ValueSpec).Names {
+						if name.Name == "_" {
+							// Having a blank constant in a group doesn't mark the whole group as used
+							continue
 						}
-						left := g.pass.TypesInfo.ObjectOf(group[i+1].(*ast.ValueSpec).Names[0])
-						right := g.pass.TypesInfo.ObjectOf(names[len(names)-1])
-						g.use(left, right)
-						g.use(right, left)
+
+						obj := g.pass.TypesInfo.ObjectOf(name)
+						if first == nil {
+							first = obj
+						} else {
+							g.use(obj, prev)
+						}
+						prev = obj
+						last = obj
 					}
+				}
+				if first != nil && first != last {
+					g.use(first, last)
 				}
 			}
 
@@ -683,6 +702,7 @@ func (g *graph) decl(decl ast.Decl, by types.Object) {
 		}
 
 	case *ast.FuncDecl:
+		// XXX calling OriginMethod is unnecessary if we use types.Func.Origin
 		obj := typeparams.OriginMethod(g.pass.TypesInfo.ObjectOf(decl.Name).(*types.Func))
 		g.see(obj, by)
 
@@ -972,9 +992,6 @@ func (g *graph) results() (used, unused []types.Object) {
 
 	// OPT(dh): can we find meaningful initial capacities for the used and unused slices?
 	for _, n := range g.Nodes {
-		if n.obj.Name() == "_" {
-			continue
-		}
 		switch obj := n.obj.(type) {
 		case *types.Var:
 			if obj.Name() == "" && obj.IsField() {

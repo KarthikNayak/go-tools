@@ -8,7 +8,7 @@ func fn1() bool { //@ used(false)
 	var v interface{} = t1{}
 	switch obj := v.(type) {
 	case interface {
-		fragment() //@ used(false)
+		fragment()
 	}:
 		obj.fragment()
 	}
@@ -26,6 +26,17 @@ func Fn() bool { //@ used(true)
 		fragment() //@ used(true)
 	}:
 		obj.fragment()
+	}
+	return false
+}
+
+func Fn2() bool { //@ used(true)
+	var v interface{} = t2{}
+	switch obj := v.(type) {
+	case interface {
+		fragment() //@ used(true)
+	}:
+		_ = obj
 	}
 	return false
 }

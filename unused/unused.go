@@ -113,11 +113,11 @@ var Debug io.Writer
     way, types aren't incorrectly marked reachable through the edge
     from method to type.
 
-  - (8.3) All interface methods are marked as used, even if they never get
+  - [X] (8.3) All interface methods are marked as used, even if they never get
     called. This is to accommodate sum types (unexported interface
     method that must exist but never gets called.)
 
-  - (8.4) All embedded interfaces are marked as used. This is an
+  - [X] (8.4) All embedded interfaces are marked as used. This is an
     extension of 8.3, but we have to explicitly track embedded
     interfaces because in a chain C->B->A, B wouldn't be marked as
     used by 8.3 just because it contributes A's methods to C.
@@ -136,6 +136,8 @@ var Debug io.Writer
     of them used. a lot of the time, unused constants exist for the sake
     of completeness. See also
     https://github.com/dominikh/go-tools/issues/365
+
+    Do not, however, include constants named _ in constant groups.
 
 
 - (11.1) anonymous struct types use all their fields. we cannot

@@ -17,6 +17,13 @@ const (
 	c11 //@ used(false)
 )
 
+// constants named _ are used, but are not part of constant groups
+const (
+	c12 = 0 //@ used(false)
+	_       //@ used(true)
+	c13     //@ used(false)
+)
+
 var _ = []int{c3: 1}
 
 type T1 struct { //@ used(true)
