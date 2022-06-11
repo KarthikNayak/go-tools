@@ -8,8 +8,8 @@ type t3 struct{} //@ used(true)
 
 type alias1 = t1  //@ used(true)
 type alias2 = t2  //@ used(false)
-type alias3 = t3  //@ used(true)
-type alias4 = int //@ used(true)
+type alias3 = t3  //@ used(false)
+type alias4 = int //@ used(false)
 
 func main() { //@ used(true)
 	var _ alias1

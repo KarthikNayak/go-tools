@@ -9,8 +9,7 @@ type c4 struct{} //@ used(true)
 type c5 struct{} //@ used(true)
 type c6 struct{} //@ used(true)
 type c7 struct{} //@ used(true)
-// c8 should be unused, but see https://staticcheck.io/issues/1199
-type c8 struct{} //@ used(true)
+type c8 struct{} //@ used(false)
 type c9 struct{} //@ used(true)
 
 type S1[T c1] struct{}  //@ used(true)
@@ -57,11 +56,16 @@ func (recv s1[a]) foo() { recv.foo(); recv.bar(); recv.baz() } //@ used(false)
 func (recv s1[b]) bar() { recv.foo(); recv.bar(); recv.baz() } //@ used(false)
 func (recv s1[c]) baz() { recv.foo(); recv.bar(); recv.baz() } //@ used(false)
 
-func fn7[T interface{ foo() }]() {} //@ used(false)
+func fn7[T interface { //@ used(false)
+	foo()
+}]() {
+}
+
 func fn8[T struct { //@ used(false)
 	x int
 }]() {
 }
+
 func Fn9[T struct { //@ used(true)
 	X *s2 //@ used(true)
 }]() {
@@ -85,7 +89,9 @@ type Bar *Node[foo] //@ used(true)
 
 func (n Node[T]) anyMethod() {} //@ used(false)
 
-func fn11[T ~struct{ Field int }]() { //@ used(false)
+func fn11[T ~struct { //@ used(false)
+	Field int
+}]() {
 	// don't crash because of the composite literal
 	_ = T{Field: 42}
 }

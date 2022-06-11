@@ -51,3 +51,9 @@ func Fn() { //@ used(true)
 	var x interface{} = v4
 	_ = x.(I2)
 }
+
+// Text pointer receivers
+type T2 struct{} //@ used(true)
+
+func (*T2) fn1() {} //@ used(true)
+func (*T2) fn2() {} //@ used(false)

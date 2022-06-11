@@ -132,7 +132,7 @@ import (
 	"honnef.co/go/tools/go/loader"
 	tsync "honnef.co/go/tools/internal/sync"
 	"honnef.co/go/tools/lintcmd/cache"
-	"honnef.co/go/tools/unused2"
+	"honnef.co/go/tools/unused"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
@@ -209,7 +209,7 @@ func serializeDirective(dir lint.Directive, fset *token.FileSet) SerializedDirec
 type ResultData struct {
 	Directives  []SerializedDirective
 	Diagnostics []Diagnostic
-	Unused      unused2.SerializedResult
+	Unused      unused.SerializedResult
 }
 
 func (r Result) Load() (ResultData, error) {
@@ -677,7 +677,7 @@ func (r *Runner) writeCacheGob(a *packageAction, kind string, data interface{}) 
 type packageActionResult struct {
 	facts   []gobFact
 	diags   []Diagnostic
-	unused  unused2.SerializedResult
+	unused  unused.SerializedResult
 	dirs    []lint.Directive
 	lpkg    *loader.Package
 	skipped bool
@@ -1001,7 +1001,7 @@ func (ar *analyzerRunner) do(act action) error {
 type analysisResult struct {
 	facts       []gobFact
 	diagnostics []Diagnostic
-	unused      unused2.SerializedResult
+	unused      unused.SerializedResult
 
 	// Only set when using test mode
 	testFacts []TestFact
@@ -1066,12 +1066,12 @@ func (r *subrunner) runAnalyzers(pkgAct *packageAction, pkg *loader.Package) (an
 		}
 	}
 
-	var unusedResult unused2.SerializedResult
+	var unusedResult unused.SerializedResult
 	for _, a := range all {
 		if a != root && a.Analyzer.Name == "U1000" && !a.failed {
 			// TODO(dh): figure out a clean abstraction, instead of
 			// special-casing U1000.
-			unusedResult = unused2.Serialize(a.Pass, a.Result.(unused2.Result), pkg.Fset)
+			unusedResult = unused.Serialize(a.Pass, a.Result.(unused.Result), pkg.Fset)
 		}
 
 		for key, fact := range a.ObjectFacts {

@@ -29,3 +29,14 @@ func Fn() bool { //@ used(true)
 	}
 	return false
 }
+
+func Fn2() bool { //@ used(true)
+	var v interface{} = t2{}
+	switch obj := v.(type) {
+	case interface {
+		fragment() //@ used(true)
+	}:
+		_ = obj
+	}
+	return false
+}

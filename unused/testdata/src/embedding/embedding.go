@@ -85,3 +85,11 @@ type i5 interface{} //@ used(true)
 type I6 interface { //@ used(true)
 	i5
 }
+
+// When recursively looking for embedded exported fields, don't visit top-level type again
+type t12 struct { //@ used(true)
+	*t12     //@ used(false)
+	F    int //@ used(true)
+}
+
+var _ = t12{}

@@ -21,7 +21,7 @@ import (
 	"honnef.co/go/tools/go/loader"
 	"honnef.co/go/tools/lintcmd/cache"
 	"honnef.co/go/tools/lintcmd/runner"
-	"honnef.co/go/tools/unused2"
+	"honnef.co/go/tools/unused"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
@@ -489,7 +489,7 @@ type unusedKey struct {
 
 type unusedPair struct {
 	key unusedKey
-	obj unused2.SerializedObject
+	obj unused.SerializedObject
 }
 
 func success(allowedAnalyzers map[string]bool, res runner.ResultData) []diagnostic {

@@ -1,12 +1,4 @@
-// Package unused contains code for finding unused code.
 package unused
-
-// TODO(dh): don't add instantiated types/methods to the graph. add the origin types/methods.
-
-// TODO do we need to track pointer types, or could we just dereference pointer types and track those?
-
-// TODO can we limit ourselves to tracking named types, or more specifically their type names? that way the graph
-// consists entirely of types.Objects.
 
 import (
 	"fmt"
@@ -17,34 +9,16 @@ import (
 	"reflect"
 	"strings"
 
-	"honnef.co/go/tools/analysis/code"
+	"golang.org/x/exp/typeparams"
+	"golang.org/x/tools/go/analysis"
 	"honnef.co/go/tools/analysis/facts/directives"
 	"honnef.co/go/tools/analysis/facts/generated"
 	"honnef.co/go/tools/analysis/lint"
-	"honnef.co/go/tools/analysis/report"
 	"honnef.co/go/tools/go/ast/astutil"
-	"honnef.co/go/tools/go/ir"
 	"honnef.co/go/tools/go/types/typeutil"
-	"honnef.co/go/tools/internal/passes/buildir"
-
-	"golang.org/x/exp/typeparams"
-	"golang.org/x/tools/go/analysis"
 )
 
 var Debug io.Writer
-
-// The graph we construct omits nodes along a path that do not
-// contribute any new information to the solution. For example, the
-// full graph for a function with a receiver would be Func ->
-// Signature -> Var -> Type. However, since signatures cannot be
-// unused, and receivers are always considered used, we can compact
-// the graph down to Func -> Type. This makes the graph smaller, but
-// harder to debug.
-
-// TODO(dh): conversions between structs mark fields as used, but the
-// conversion itself isn't part of that subgraph. even if the function
-// containing the conversion is unused, the fields will be marked as
-// used.
 
 // TODO(dh): we cannot observe function calls in assembly files.
 
@@ -88,14 +62,14 @@ var Debug io.Writer
     either struct use each other. the fields are relevant for the
     conversion, but only if the fields are also accessed outside the
     conversion.
-  - [ ] (5.2) when converting to or from unsafe.Pointer, mark all fields as used.
+  - [X] (5.2) when converting to or from unsafe.Pointer, mark all fields as used.
 
 - structs use:
   - [X] (6.1) fields of type NoCopy sentinel
   - [X] (6.2) exported fields
   - [X] (6.3) embedded fields that help implement interfaces (either fully implements it, or contributes required methods) (recursively)
-  - [ ] (6.4) embedded fields that have exported methods (recursively)
-  - [ ] (6.5) embedded structs that have exported fields (recursively)
+  - [X] (6.4) embedded fields that have exported methods (recursively)
+  - [X] (6.5) embedded structs that have exported fields (recursively)
 
 - [X] (7.1) field accesses use fields
 - [X] (7.2) fields use their types
@@ -126,10 +100,10 @@ var Debug io.Writer
   - (9.2) variables use their types
   - (9.3) types use their underlying and element types
   - (9.4) conversions use the type they convert to
-  - (9.5) instructions use their operands
-  - (9.6) instructions use their operands' types
-  - (9.7) variable _reads_ use variables, writes do not, except in tests
-  - (9.8) runtime functions that may be called from user code via the compiler
+  - [X] (9.7) variable _reads_ use variables, writes do not, except in tests
+  - [ ] (9.8) runtime functions that may be called from user code via the compiler
+  - [X] (9.9) objects named the blank identifier are used. They cannot be referred to and are usually used explicitly to
+     use something that would otherwise be unused.
 
 - const groups:
   - [X] (10.1) if one constant out of a block of constants is used, mark all
@@ -153,274 +127,31 @@ var Debug io.Writer
 
 */
 
+// TODO(dh): currently, types use methods that implement interfaces. However, this makes a method used even if the
+// relevant interface is never used. What if instead interfaces used those methods? Right now we cannot do that, because
+// methods use their receivers, so using a method uses the type. But do we need that edge? Is there a way to refer to a
+// method without explicitly mentioning the type somewhere? If not, the edge from method to receiver is superfluous.
+
+// XXX improve tests to not only check for used/unused, but also for quiet
+
+// XXX vet all code for proper use of core types
+
+func debugf(f string, v ...interface{}) {
+	if Debug != nil {
+		fmt.Fprintf(Debug, f, v...)
+	}
+}
+
 func assert(b bool) {
 	if !b {
 		panic("failed assertion")
 	}
 }
 
-// /usr/lib/go/src/runtime/proc.go:433:6: func badmorestackg0 is unused (U1000)
-
-// Functions defined in the Go runtime that may be called through
-// compiler magic or via assembly.
-var RuntimeFuncs = map[string]bool{
-	// The first part of the list is copied from
-	// cmd/compile/internal/gc/builtin.go, var runtimeDecls
-	"newobject":            true,
-	"panicindex":           true,
-	"panicslice":           true,
-	"panicdivide":          true,
-	"panicmakeslicelen":    true,
-	"throwinit":            true,
-	"panicwrap":            true,
-	"gopanic":              true,
-	"gorecover":            true,
-	"goschedguarded":       true,
-	"printbool":            true,
-	"printfloat":           true,
-	"printint":             true,
-	"printhex":             true,
-	"printuint":            true,
-	"printcomplex":         true,
-	"printstring":          true,
-	"printpointer":         true,
-	"printiface":           true,
-	"printeface":           true,
-	"printslice":           true,
-	"printnl":              true,
-	"printsp":              true,
-	"printlock":            true,
-	"printunlock":          true,
-	"concatstring2":        true,
-	"concatstring3":        true,
-	"concatstring4":        true,
-	"concatstring5":        true,
-	"concatstrings":        true,
-	"cmpstring":            true,
-	"intstring":            true,
-	"slicebytetostring":    true,
-	"slicebytetostringtmp": true,
-	"slicerunetostring":    true,
-	"stringtoslicebyte":    true,
-	"stringtoslicerune":    true,
-	"slicecopy":            true,
-	"slicestringcopy":      true,
-	"decoderune":           true,
-	"countrunes":           true,
-	"convI2I":              true,
-	"convT16":              true,
-	"convT32":              true,
-	"convT64":              true,
-	"convTstring":          true,
-	"convTslice":           true,
-	"convT2E":              true,
-	"convT2Enoptr":         true,
-	"convT2I":              true,
-	"convT2Inoptr":         true,
-	"assertE2I":            true,
-	"assertE2I2":           true,
-	"assertI2I":            true,
-	"assertI2I2":           true,
-	"panicdottypeE":        true,
-	"panicdottypeI":        true,
-	"panicnildottype":      true,
-	"ifaceeq":              true,
-	"efaceeq":              true,
-	"fastrand":             true,
-	"makemap64":            true,
-	"makemap":              true,
-	"makemap_small":        true,
-	"mapaccess1":           true,
-	"mapaccess1_fast32":    true,
-	"mapaccess1_fast64":    true,
-	"mapaccess1_faststr":   true,
-	"mapaccess1_fat":       true,
-	"mapaccess2":           true,
-	"mapaccess2_fast32":    true,
-	"mapaccess2_fast64":    true,
-	"mapaccess2_faststr":   true,
-	"mapaccess2_fat":       true,
-	"mapassign":            true,
-	"mapassign_fast32":     true,
-	"mapassign_fast32ptr":  true,
-	"mapassign_fast64":     true,
-	"mapassign_fast64ptr":  true,
-	"mapassign_faststr":    true,
-	"mapiterinit":          true,
-	"mapdelete":            true,
-	"mapdelete_fast32":     true,
-	"mapdelete_fast64":     true,
-	"mapdelete_faststr":    true,
-	"mapiternext":          true,
-	"mapclear":             true,
-	"makechan64":           true,
-	"makechan":             true,
-	"chanrecv1":            true,
-	"chanrecv2":            true,
-	"chansend1":            true,
-	"closechan":            true,
-	"writeBarrier":         true,
-	"typedmemmove":         true,
-	"typedmemclr":          true,
-	"typedslicecopy":       true,
-	"selectnbsend":         true,
-	"selectnbrecv":         true,
-	"selectnbrecv2":        true,
-	"selectsetpc":          true,
-	"selectgo":             true,
-	"block":                true,
-	"makeslice":            true,
-	"makeslice64":          true,
-	"growslice":            true,
-	"memmove":              true,
-	"memclrNoHeapPointers": true,
-	"memclrHasPointers":    true,
-	"memequal":             true,
-	"memequal8":            true,
-	"memequal16":           true,
-	"memequal32":           true,
-	"memequal64":           true,
-	"memequal128":          true,
-	"int64div":             true,
-	"uint64div":            true,
-	"int64mod":             true,
-	"uint64mod":            true,
-	"float64toint64":       true,
-	"float64touint64":      true,
-	"float64touint32":      true,
-	"int64tofloat64":       true,
-	"uint64tofloat64":      true,
-	"uint32tofloat64":      true,
-	"complex128div":        true,
-	"racefuncenter":        true,
-	"racefuncenterfp":      true,
-	"racefuncexit":         true,
-	"raceread":             true,
-	"racewrite":            true,
-	"racereadrange":        true,
-	"racewriterange":       true,
-	"msanread":             true,
-	"msanwrite":            true,
-	"x86HasPOPCNT":         true,
-	"x86HasSSE41":          true,
-	"arm64HasATOMICS":      true,
-
-	// The second part of the list is extracted from assembly code in
-	// the standard library, with the exception of the runtime package itself
-	"abort":                 true,
-	"aeshashbody":           true,
-	"args":                  true,
-	"asminit":               true,
-	"badctxt":               true,
-	"badmcall2":             true,
-	"badmcall":              true,
-	"badmorestackg0":        true,
-	"badmorestackgsignal":   true,
-	"badsignal2":            true,
-	"callbackasm1":          true,
-	"callCfunction":         true,
-	"cgocallback_gofunc":    true,
-	"cgocallbackg":          true,
-	"checkgoarm":            true,
-	"check":                 true,
-	"debugCallCheck":        true,
-	"debugCallWrap":         true,
-	"emptyfunc":             true,
-	"entersyscall":          true,
-	"exit":                  true,
-	"exits":                 true,
-	"exitsyscall":           true,
-	"externalthreadhandler": true,
-	"findnull":              true,
-	"goexit1":               true,
-	"gostring":              true,
-	"i386_set_ldt":          true,
-	"_initcgo":              true,
-	"init_thread_tls":       true,
-	"ldt0setup":             true,
-	"libpreinit":            true,
-	"load_g":                true,
-	"morestack":             true,
-	"mstart":                true,
-	"nacl_sysinfo":          true,
-	"nanotimeQPC":           true,
-	"nanotime":              true,
-	"newosproc0":            true,
-	"newproc":               true,
-	"newstack":              true,
-	"noted":                 true,
-	"nowQPC":                true,
-	"osinit":                true,
-	"printf":                true,
-	"racecallback":          true,
-	"reflectcallmove":       true,
-	"reginit":               true,
-	"rt0_go":                true,
-	"save_g":                true,
-	"schedinit":             true,
-	"setldt":                true,
-	"settls":                true,
-	"sighandler":            true,
-	"sigprofNonGo":          true,
-	"sigtrampgo":            true,
-	"_sigtramp":             true,
-	"sigtramp":              true,
-	"stackcheck":            true,
-	"syscall_chdir":         true,
-	"syscall_chroot":        true,
-	"syscall_close":         true,
-	"syscall_dup2":          true,
-	"syscall_execve":        true,
-	"syscall_exit":          true,
-	"syscall_fcntl":         true,
-	"syscall_forkx":         true,
-	"syscall_gethostname":   true,
-	"syscall_getpid":        true,
-	"syscall_ioctl":         true,
-	"syscall_pipe":          true,
-	"syscall_rawsyscall6":   true,
-	"syscall_rawSyscall6":   true,
-	"syscall_rawsyscall":    true,
-	"syscall_RawSyscall":    true,
-	"syscall_rawsysvicall6": true,
-	"syscall_setgid":        true,
-	"syscall_setgroups":     true,
-	"syscall_setpgid":       true,
-	"syscall_setsid":        true,
-	"syscall_setuid":        true,
-	"syscall_syscall6":      true,
-	"syscall_syscall":       true,
-	"syscall_Syscall":       true,
-	"syscall_sysvicall6":    true,
-	"syscall_wait4":         true,
-	"syscall_write":         true,
-	"traceback":             true,
-	"tstart":                true,
-	"usplitR0":              true,
-	"wbBufFlush":            true,
-	"write":                 true,
-}
-
-type pkg struct {
-	Fset       *token.FileSet
-	Files      []*ast.File
-	Pkg        *types.Package
-	TypesInfo  *types.Info
-	TypesSizes types.Sizes
-	IR         *ir.Package
-	SrcFuncs   []*ir.Function
-	Directives []lint.Directive
-}
-
 // TODO(dh): should we return a map instead of two slices?
 type Result struct {
 	Used   []types.Object
 	Unused []types.Object
-}
-
-type SerializedResult struct {
-	Used   []SerializedObject
-	Unused []SerializedObject
 }
 
 var Analyzer = &lint.Analyzer{
@@ -431,312 +162,67 @@ var Analyzer = &lint.Analyzer{
 		Name:       "U1000",
 		Doc:        "Unused code",
 		Run:        run,
-		Requires:   []*analysis.Analyzer{buildir.Analyzer, generated.Analyzer, directives.Analyzer},
+		Requires:   []*analysis.Analyzer{generated.Analyzer, directives.Analyzer},
 		ResultType: reflect.TypeOf(Result{}),
 	},
 }
 
-type SerializedObject struct {
-	Name            string
-	Position        token.Position
-	DisplayPosition token.Position
-	Kind            string
-	InGenerated     bool
-}
-
-func TypString(obj types.Object) string {
-	switch obj := obj.(type) {
-	case *types.Func:
-		return "func"
-	case *types.Var:
-		if obj.IsField() {
-			return "field"
-		}
-		return "var"
-	case *types.Const:
-		return "const"
-	case *types.TypeName:
-		if _, ok := obj.Type().(*types.TypeParam); ok {
-			return "type param"
-		} else {
-			return "type"
-		}
-	default:
-		return "identifier"
-	}
-}
-
-func Serialize(pass *analysis.Pass, res Result, fset *token.FileSet) SerializedResult {
-	// OPT(dh): there's no point in serializing Used objects that are
-	// always used, such as exported names, blank identifiers, or
-	// anonymous struct fields. Used only exists to overrule Unused of
-	// a different package. If something can never be unused, then its
-	// presence in Used is useless.
-	//
-	// I'm not sure if this should happen when serializing, or when
-	// returning Result.
-
-	out := SerializedResult{
-		Used:   make([]SerializedObject, len(res.Used)),
-		Unused: make([]SerializedObject, len(res.Unused)),
-	}
-	for i, obj := range res.Used {
-		out.Used[i] = serializeObject(pass, fset, obj)
-	}
-	for i, obj := range res.Unused {
-		out.Unused[i] = serializeObject(pass, fset, obj)
-	}
-	return out
-}
-
-func serializeObject(pass *analysis.Pass, fset *token.FileSet, obj types.Object) SerializedObject {
-	name := obj.Name()
-	if sig, ok := obj.Type().(*types.Signature); ok && sig.Recv() != nil {
-		switch sig.Recv().Type().(type) {
-		case *types.Named, *types.Pointer:
-			typ := types.TypeString(sig.Recv().Type(), func(*types.Package) string { return "" })
-			if len(typ) > 0 && typ[0] == '*' {
-				name = fmt.Sprintf("(%s).%s", typ, obj.Name())
-			} else if len(typ) > 0 {
-				name = fmt.Sprintf("%s.%s", typ, obj.Name())
-			}
-		}
-	}
-	return SerializedObject{
-		Name:            name,
-		Position:        fset.PositionFor(obj.Pos(), false),
-		DisplayPosition: report.DisplayPosition(fset, obj.Pos()),
-		Kind:            TypString(obj),
-		InGenerated:     code.IsGenerated(pass, obj.Pos()),
-	}
-}
-
-func Debugf(f string, v ...interface{}) {
-	if Debug != nil {
-		fmt.Fprintf(Debug, f, v...)
-	}
-}
-
 func run(pass *analysis.Pass) (interface{}, error) {
-	irpkg := pass.ResultOf[buildir.Analyzer].(*buildir.IR)
-	dirs := pass.ResultOf[directives.Analyzer].([]lint.Directive)
-	pkg := &pkg{
-		Fset:       pass.Fset,
-		Files:      pass.Files,
-		Pkg:        pass.Pkg,
-		TypesInfo:  pass.TypesInfo,
-		TypesSizes: pass.TypesSizes,
-		IR:         irpkg.Pkg,
-		SrcFuncs:   irpkg.SrcFuncs,
-		Directives: dirs,
+	g := &graph{
+		pass:  pass,
+		Nodes: map[types.Object]*node{},
 	}
+	g.Root = g.newNode(nil)
+	g.entry(pass)
+	used, unused := g.results()
 
-	g := newGraph()
-	g.entry(pkg)
-	used, unused := results(g)
-
-	if Debug != nil {
+	if true {
+		// XXX make debug printing conditional
 		debugNode := func(n *node) {
 			if n.obj == nil {
-				Debugf("n%d [label=\"Root\"];\n", n.id)
+				debugf("n%d [label=\"Root\"];\n", n.id)
 			} else {
 				color := "red"
 				if n.seen {
 					color = "green"
+				} else if n.quiet {
+					color = "grey"
 				}
-				Debugf("n%d [label=%q, color=%q];\n", n.id, fmt.Sprintf("(%T) %s", n.obj, n.obj), color)
+				debugf("n%d [label=%q, color=%q];\n", n.id, fmt.Sprintf("(%T) %s", n.obj, n.obj), color)
 			}
-			for _, e := range n.used {
-				for i := EdgeKind(1); i < 64; i++ {
-					if e.kind.is(1 << i) {
-						Debugf("n%d -> n%d [label=%q];\n", n.id, e.node.id, EdgeKind(1<<i))
-					}
-				}
+			for _, e := range n.uses {
+				debugf("n%d -> n%d;\n", n.id, e.id)
+			}
+
+			for _, owned := range n.owns {
+				debugf("n%d -> n%d [style=dashed];\n", n.id, owned.id)
 			}
 		}
 
-		Debugf("digraph{\n")
+		debugf("digraph{\n")
 		debugNode(g.Root)
 		for _, v := range g.Nodes {
 			debugNode(v)
 		}
-		for _, node := range g.TypeNodes {
-			debugNode(node)
-		}
 
-		Debugf("}\n")
+		debugf("}\n")
 	}
 
 	return Result{Used: used, Unused: unused}, nil
 }
 
-func results(g *graph) (used, unused []types.Object) {
-	g.color(g.Root)
-	for _, node := range g.TypeNodes {
-		if node.seen {
-			continue
-		}
-		switch obj := node.obj.(type) {
-		case *types.Struct:
-			for i := 0; i < obj.NumFields(); i++ {
-				if node, ok := g.nodeMaybe(obj.Field(i)); ok {
-					node.quiet = true
-				}
-			}
-		case *types.Interface:
-			for i := 0; i < obj.NumExplicitMethods(); i++ {
-				m := obj.ExplicitMethod(i)
-				if node, ok := g.nodeMaybe(m); ok {
-					node.quiet = true
-				}
-			}
-		}
-	}
-
-	// OPT(dh): can we find meaningful initial capacities for the used and unused slices?
-
-	for _, n := range g.Nodes {
-		if obj, ok := n.obj.(types.Object); ok {
-			switch obj := obj.(type) {
-			case *types.Var:
-				// don't report unnamed variables (interface embedding)
-				if obj.Name() == "" && obj.IsField() {
-					continue
-				}
-			case types.Object:
-				if obj.Name() == "_" {
-					continue
-				}
-			}
-
-			if obj.Pkg() != nil {
-				if n.seen {
-					used = append(used, obj)
-				} else if !n.quiet {
-					if obj.Pkg() != g.pkg.Pkg {
-						continue
-					}
-					unused = append(unused, obj)
-				}
-			}
-		}
-	}
-
-	return used, unused
-}
-
 type graph struct {
-	Root *node
-
-	// Mapping of types T to canonical *T
-	pointers map[types.Type]*types.Pointer
-
-	seenTypes map[types.Type]struct{}
-
-	TypeNodes map[types.Type]*node
-	Nodes     map[interface{}]*node
-
-	// context
-	pkg         *pkg
-	seenFns     map[*ir.Function]struct{}
+	Root        *node
+	Nodes       map[types.Object]*node
+	pass        *analysis.Pass
 	nodeCounter uint64
+
+	// package-level named types
+	namedTypes     []*types.TypeName
+	interfaceTypes []*types.Interface
 }
 
-func newGraph() *graph {
-	g := &graph{
-		Nodes:     map[interface{}]*node{},
-		seenFns:   map[*ir.Function]struct{}{},
-		seenTypes: map[types.Type]struct{}{},
-		TypeNodes: map[types.Type]*node{},
-		pointers:  map[types.Type]*types.Pointer{},
-	}
-	g.Root = g.newNode(nil)
-	return g
-}
-
-func (g *graph) newPointer(typ types.Type) *types.Pointer {
-	if p, ok := g.pointers[typ]; ok {
-		return p
-	} else {
-		p := types.NewPointer(typ)
-		g.pointers[typ] = p
-		g.see(p)
-		return p
-	}
-}
-
-func (g *graph) color(root *node) {
-	if root.seen {
-		return
-	}
-	root.seen = true
-	for _, e := range root.used {
-		g.color(e.node)
-	}
-}
-
-type constGroup struct {
-	// give the struct a size to get unique pointers
-	_ byte
-}
-
-func (constGroup) String() string { return "const group" }
-
-type edge struct {
-	node *node
-	kind EdgeKind
-}
-
-type node struct {
-	obj interface{}
-	id  uint64
-
-	// OPT(dh): evaluate using a map instead of a slice to avoid
-	// duplicate edges.
-	used []edge
-
-	// set during final graph walk if node is reachable
-	seen  bool
-	quiet bool
-}
-
-func (g *graph) nodeMaybe(obj types.Object) (*node, bool) {
-	if node, ok := g.Nodes[obj]; ok {
-		return node, true
-	}
-	return nil, false
-}
-
-func (g *graph) node(obj interface{}) (n *node, new bool) {
-	switch obj := obj.(type) {
-	case types.Type:
-		if v := g.TypeNodes[obj]; v != nil {
-			return v, false
-		}
-		n = g.newNode(obj)
-		g.TypeNodes[obj] = n
-		return n, true
-	case types.Object:
-		// OPT(dh): the types.Object and default cases are identical
-		if node, ok := g.Nodes[obj]; ok {
-			return node, false
-		}
-
-		n = g.newNode(obj)
-		g.Nodes[obj] = n
-		return n, true
-	default:
-		if node, ok := g.Nodes[obj]; ok {
-			return node, false
-		}
-
-		n = g.newNode(obj)
-		g.Nodes[obj] = n
-		return n, true
-	}
-}
-
-func (g *graph) newNode(obj interface{}) *node {
+func (g *graph) newNode(obj types.Object) *node {
 	g.nodeCounter++
 	return &node{
 		obj: obj,
@@ -744,170 +230,101 @@ func (g *graph) newNode(obj interface{}) *node {
 	}
 }
 
-func (n *node) use(n2 *node, kind EdgeKind) {
-	assert(n2 != nil)
-	n.used = append(n.used, edge{node: n2, kind: kind})
-}
-
-// IsIrrelevant reports whether an object's presence in the graph is
-// of any relevance. A lot of objects will never have outgoing edges,
-// nor meaningful incoming ones. Examples are basic types and empty
-// signatures, among many others.
-//
-// Dropping these objects should have no effect on correctness, but
-// may improve performance. It also helps with debugging, as it
-// greatly reduces the size of the graph.
-func IsIrrelevant(obj interface{}) bool {
-	if obj, ok := obj.(types.Object); ok {
-		switch obj := obj.(type) {
-		case *types.Var:
-			if obj.IsField() {
-				// We need to track package fields
-				return false
-			}
-			if obj.Pkg() != nil && obj.Parent() == obj.Pkg().Scope() {
-				// We need to track package-level variables
-				return false
-			}
-			return IsIrrelevant(obj.Type())
-		default:
-			return false
-		}
+func (g *graph) node(obj types.Object) *node {
+	if obj == nil {
+		return g.Root
 	}
-	if T, ok := obj.(types.Type); ok {
-		switch T := T.(type) {
-		case *types.Array:
-			return IsIrrelevant(T.Elem())
-		case *types.Slice:
-			return IsIrrelevant(T.Elem())
-		case *types.Basic:
-			return true
-		case *types.Tuple:
-			for i := 0; i < T.Len(); i++ {
-				if !IsIrrelevant(T.At(i).Type()) {
-					return false
-				}
-			}
-			return true
-		case *types.Signature:
-			if T.Recv() != nil {
-				return false
-			}
-			for i := 0; i < T.Params().Len(); i++ {
-				if !IsIrrelevant(T.Params().At(i)) {
-					return false
-				}
-			}
-			for i := 0; i < T.Results().Len(); i++ {
-				if !IsIrrelevant(T.Results().At(i)) {
-					return false
-				}
-			}
-			return true
-		case *types.Interface:
-			return T.NumMethods() == 0 && T.NumEmbeddeds() == 0
-		case *types.Pointer:
-			return IsIrrelevant(T.Elem())
-		case *types.Map:
-			return IsIrrelevant(T.Key()) && IsIrrelevant(T.Elem())
-		case *types.Struct:
-			return T.NumFields() == 0
-		case *types.Chan:
-			return IsIrrelevant(T.Elem())
-		default:
-			return false
-		}
+	obj = origin(obj)
+	if n, ok := g.Nodes[obj]; ok {
+		return n
 	}
-	return false
-}
-
-func (g *graph) see(obj interface{}) *node {
-	if IsIrrelevant(obj) {
-		return nil
-	}
-
-	assert(obj != nil)
-
-	if fn, ok := obj.(*types.Func); ok {
-		obj = typeparams.OriginMethod(fn)
-	}
-	if t, ok := obj.(*types.Named); ok {
-		obj = t.Origin()
-	}
-
-	// add new node to graph
-	node, _ := g.node(obj)
-
-	if p, ok := obj.(*types.Pointer); ok {
-		if pt, ok := g.pointers[p.Elem()]; ok {
-			// We've used graph.newPointer before we saw this pointer; add an edge that marks the two pointers as being
-			// identical
-			if p != pt {
-				g.use(p, pt, edgeSamePointer)
-				g.use(pt, p, edgeSamePointer)
-			}
-		} else {
-			g.pointers[p.Elem()] = p
-		}
-	}
-
-	return node
-}
-
-func (g *graph) use(used, by interface{}, kind EdgeKind) {
-	if IsIrrelevant(used) {
-		return
-	}
-
-	assert(used != nil)
-	if obj, ok := by.(types.Object); ok && obj.Pkg() != nil {
-		if obj.Pkg() != g.pkg.Pkg {
-			return
-		}
-	}
-
-	if fn, ok := used.(*types.Func); ok {
-		used = typeparams.OriginMethod(fn)
-	}
-	if fn, ok := by.(*types.Func); ok {
-		by = typeparams.OriginMethod(fn)
-	}
-
-	if t, ok := used.(*types.Named); ok {
-		used = t.Origin()
-	}
-	if t, ok := by.(*types.Named); ok {
-		by = t.Origin()
-	}
-
-	usedNode, new := g.node(used)
-	assert(!new)
-	if by == nil {
-		g.Root.use(usedNode, kind)
-	} else {
-		byNode, new := g.node(by)
-		assert(!new)
-		byNode.use(usedNode, kind)
-	}
-}
-
-func (g *graph) seeAndUse(used, by interface{}, kind EdgeKind) *node {
-	n := g.see(used)
-	g.use(used, by, kind)
+	n := g.newNode(obj)
+	g.Nodes[obj] = n
 	return n
 }
 
-func (g *graph) entry(pkg *pkg) {
-	g.pkg = pkg
-	scopes := map[*types.Scope]*ir.Function{}
-	for _, fn := range pkg.SrcFuncs {
-		if fn.Object() != nil {
-			scope := fn.Object().(*types.Func).Scope()
-			scopes[scope] = fn
-		}
+type node struct {
+	// OPT(dh): we could trivially turn this from AoS into SoA. Benchmark if that has any benefits.
+	// OPT(dh): we can put the id, seen, and quiet into a single 64 bit variable, with 62 bits for the ID
+	// OPT(dh): ^ a 32 bit variable would probably suffice. 30 bits would allow for a billion different objects, which would, at a minimum, require a 3 GB large source file.
+	// OPT(dh): ^ benchmark if these changes have any measurable effect on CPU or memory usage
+
+	obj types.Object
+	id  uint64
+
+	// OPT(dh): evaluate using a map instead of a slice to avoid
+	// duplicate edges.
+	uses []*node
+	owns []*node
+
+	// set during final graph walk if node is reachable
+	seen  bool
+	quiet bool
+}
+
+func origin(obj types.Object) types.Object {
+	// XXX this depends on Go 1.19. How can we achieve the same in 1.18?
+	switch obj := obj.(type) {
+	case *types.Var:
+		return obj.Origin()
+	case *types.Func:
+		return obj.Origin()
+	default:
+		return obj
+	}
+}
+
+func (g *graph) see(obj, owner types.Object) {
+	if obj == nil {
+		panic("saw nil object")
 	}
 
-	for _, f := range pkg.Files {
+	// XXX don't track objects in other packages
+	// XXX use isIrrelevant
+
+	nObj := g.node(obj)
+	if owner != nil {
+		nOwner := g.node(owner)
+		nOwner.owns = append(nOwner.owns, nObj)
+	}
+}
+
+func ourIsIrrelevant(obj types.Object) bool {
+	// XXX rename this function
+	switch obj.(type) {
+	case *types.PkgName:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *graph) use(used, by types.Object) {
+	if used.Pkg() != g.pass.Pkg {
+		return
+	}
+
+	if ourIsIrrelevant(used) {
+		return
+	}
+
+	nUsed := g.node(used)
+	nBy := g.node(by)
+	nBy.uses = append(nBy.uses, nUsed)
+}
+
+func (g *graph) color(root *node) {
+	if root.seen {
+		return
+	}
+	root.seen = true
+	for _, n := range root.uses {
+		g.color(n)
+	}
+}
+
+func (g *graph) entry(pass *analysis.Pass) {
+	for _, f := range pass.Files {
 		for _, cg := range f.Comments {
 			for _, c := range cg.List {
 				if strings.HasPrefix(c.Text, "//go:linkname ") {
@@ -919,300 +336,56 @@ func (g *graph) entry(pkg *pkg) {
 					// (1.8) packages use symbols linked via go:linkname
 					fields := strings.Fields(c.Text)
 					if len(fields) == 3 {
-						if m, ok := pkg.IR.Members[fields[1]]; ok {
-							var obj types.Object
-							switch m := m.(type) {
-							case *ir.Global:
-								obj = m.Object()
-							case *ir.Function:
-								obj = m.Object()
-							default:
-								panic(fmt.Sprintf("unhandled type: %T", m))
-							}
-							assert(obj != nil)
-							g.seeAndUse(obj, nil, edgeLinkname)
+						obj := pass.Pkg.Scope().Lookup(fields[1])
+						if obj == nil {
+							continue
 						}
+						g.use(obj, nil)
 					}
 				}
 			}
 		}
 	}
 
-	surroundingFunc := func(obj types.Object) *ir.Function {
-		scope := obj.Parent()
-		for scope != nil {
-			if fn := scopes[scope]; fn != nil {
-				return fn
-			}
-			scope = scope.Parent()
-		}
-		return nil
-	}
-
-	// IR form won't tell us about locally scoped types that aren't
-	// being used. Walk the list of Defs to get all named types.
-	//
-	// IR form also won't tell us about constants; use Defs and Uses
-	// to determine which constants exist and which are being used.
-	for _, obj := range pkg.TypesInfo.Defs {
-		switch obj := obj.(type) {
-		case *types.TypeName:
-			// types are being handled by walking the AST
-		case *types.Const:
-			g.see(obj)
-			fn := surroundingFunc(obj)
-			if fn == nil && obj.Exported() {
-				// (1.4) packages use exported constants
-				g.use(obj, nil, edgeExportedConstant)
-			}
-			g.typ(obj.Type(), nil)
-			g.seeAndUse(obj.Type(), obj, edgeType)
+	for _, f := range pass.Files {
+		for _, decl := range f.Decls {
+			g.decl(decl, nil)
 		}
 	}
 
-	// Find constants being used inside functions, find sinks in tests
-	for _, fn := range pkg.SrcFuncs {
-		if fn.Object() != nil {
-			g.see(fn.Object())
+	processMethodSet := func(named *types.TypeName, ms *types.MethodSet) {
+		for i := 0; i < ms.Len(); i++ {
+			// (2.1) named types use exported methods
+			// (6.4) structs use embedded fields that have exported methods
+			//
+			// By reading the selection, we read all embedded fields that are part of the path
+			m := ms.At(i)
+			if token.IsExported(m.Obj().Name()) {
+				g.readSelection(m, named)
+			}
 		}
-		n := fn.Source()
-		if n == nil {
-			continue
-		}
-		ast.Inspect(n, func(n ast.Node) bool {
-			switch n := n.(type) {
-			case *ast.Ident:
-				obj, ok := pkg.TypesInfo.Uses[n]
-				if !ok {
-					return true
-				}
-				switch obj := obj.(type) {
-				case *types.Const:
-					g.seeAndUse(obj, owningObject(fn), edgeUsedConstant)
-				}
-			case *ast.AssignStmt:
-				for _, expr := range n.Lhs {
-					ident, ok := expr.(*ast.Ident)
-					if !ok {
-						continue
-					}
-					obj := pkg.TypesInfo.ObjectOf(ident)
-					if obj == nil {
-						continue
-					}
-					path := pkg.Fset.File(obj.Pos()).Name()
-					if strings.HasSuffix(path, "_test.go") {
-						if obj.Parent() != nil && obj.Parent().Parent() != nil && obj.Parent().Parent().Parent() == nil {
-							// object's scope is the package, whose
-							// parent is the file, whose parent is nil
 
-							// (4.9) functions use package-level variables they assign to iff in tests (sinks for benchmarks)
-							// (9.7) variable _reads_ use variables, writes do not, except in tests
-							g.seeAndUse(obj, owningObject(fn), edgeTestSink)
-						}
+		if _, ok := named.Type().Underlying().(*types.Interface); !ok {
+			// (8.0) handle interfaces
+			//
+			// We don't care about interfaces implementing interfaces; all their methods are already used, anyway
+			for _, iface := range g.interfaceTypes {
+				if sels, ok := implements(named.Type(), iface, ms); ok {
+					for _, sel := range sels {
+						// (8.2) any concrete type implements all known interfaces
+						// (6.3) structs use embedded fields that help implement interfaces
+						g.readSelection(sel, named)
 					}
 				}
-			}
-
-			return true
-		})
-	}
-	// Find constants being used in non-function contexts
-	for _, obj := range pkg.TypesInfo.Uses {
-		_, ok := obj.(*types.Const)
-		if !ok {
-			continue
-		}
-		g.seeAndUse(obj, nil, edgeUsedConstant)
-	}
-
-	var fns []*types.Func
-	var fn *types.Func
-	var stack []ast.Node
-	for _, f := range pkg.Files {
-		ast.Inspect(f, func(n ast.Node) bool {
-			if n == nil {
-				pop := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-				if _, ok := pop.(*ast.FuncDecl); ok {
-					fns = fns[:len(fns)-1]
-					if len(fns) == 0 {
-						fn = nil
-					} else {
-						fn = fns[len(fns)-1]
-					}
-				}
-				return true
-			}
-			stack = append(stack, n)
-			switch n := n.(type) {
-			case *ast.FuncDecl:
-				fn = pkg.TypesInfo.ObjectOf(n.Name).(*types.Func)
-				fns = append(fns, fn)
-				g.see(fn)
-			case *ast.GenDecl:
-				switch n.Tok {
-				case token.CONST:
-					groups := astutil.GroupSpecs(pkg.Fset, n.Specs)
-					for _, specs := range groups {
-						if len(specs) > 1 {
-							cg := &constGroup{}
-							g.see(cg)
-							for _, spec := range specs {
-								for _, name := range spec.(*ast.ValueSpec).Names {
-									obj := pkg.TypesInfo.ObjectOf(name)
-									// (10.1) const groups
-									g.seeAndUse(obj, cg, edgeConstGroup)
-									g.use(cg, obj, edgeConstGroup)
-								}
-							}
-						}
-					}
-				case token.VAR:
-					for _, spec := range n.Specs {
-						v := spec.(*ast.ValueSpec)
-						for _, name := range v.Names {
-							T := pkg.TypesInfo.TypeOf(name)
-							if fn != nil {
-								g.seeAndUse(T, fn, edgeVarDecl)
-							} else {
-								// TODO(dh): we likely want to make
-								// the type used by the variable, not
-								// the package containing the
-								// variable. But then we have to take
-								// special care of blank identifiers.
-								g.seeAndUse(T, nil, edgeVarDecl)
-							}
-							g.typ(T, nil)
-						}
-					}
-				case token.TYPE:
-					for _, spec := range n.Specs {
-						// go/types doesn't provide a way to go from a
-						// types.Named to the named type it was based on
-						// (the t1 in type t2 t1). Therefore we walk the
-						// AST and process GenDecls.
-						//
-						// (2.2) named types use the type they're based on
-						v := spec.(*ast.TypeSpec)
-						T := pkg.TypesInfo.TypeOf(v.Type)
-						obj := pkg.TypesInfo.ObjectOf(v.Name)
-						g.see(obj)
-						g.see(T)
-						g.use(T, obj, edgeType)
-						g.typ(obj.Type(), nil)
-						g.typ(T, nil)
-
-						if v.Assign != 0 {
-							aliasFor := obj.(*types.TypeName).Type()
-							// (2.3) named types use all their aliases. we can't easily track uses of aliases
-							if IsIrrelevant(aliasFor) {
-								// We do not track the type this is an
-								// alias for (for example builtins), so
-								// just mark the alias used.
-								//
-								// FIXME(dh): what about aliases declared inside functions?
-								g.use(obj, nil, edgeAlias)
-							} else {
-								g.see(aliasFor)
-								g.seeAndUse(obj, aliasFor, edgeAlias)
-							}
-						}
-					}
-				}
-			}
-			return true
-		})
-	}
-
-	for _, m := range pkg.IR.Members {
-		switch m := m.(type) {
-		case *ir.NamedConst:
-			// nothing to do, we collect all constants from Defs
-		case *ir.Global:
-			if m.Object() != nil {
-				g.see(m.Object())
-				if m.Object().Exported() {
-					// (1.3) packages use exported variables
-					g.use(m.Object(), nil, edgeExportedVariable)
-				}
-			}
-		case *ir.Function:
-			mObj := owningObject(m)
-			if mObj != nil {
-				g.see(mObj)
-			}
-			//lint:ignore SA9003 handled implicitly
-			if m.Name() == "init" {
-				// (1.5) packages use init functions
-				//
-				// This is handled implicitly. The generated init
-				// function has no object, thus everything in it will
-				// be owned by the package.
-			}
-			// This branch catches top-level functions, not methods.
-			if m.Object() != nil && m.Object().Exported() {
-				// (1.2) packages use exported functions
-				g.use(mObj, nil, edgeExportedFunction)
-			}
-			if m.Name() == "main" && pkg.Pkg.Name() == "main" {
-				// (1.7) packages use the main function iff in the main package
-				g.use(mObj, nil, edgeMainFunction)
-			}
-			if pkg.Pkg.Path() == "runtime" && RuntimeFuncs[m.Name()] {
-				// (9.8) runtime functions that may be called from user code via the compiler
-				g.use(mObj, nil, edgeRuntimeFunction)
-			}
-			if m.Source() != nil {
-				doc := m.Source().(*ast.FuncDecl).Doc
-				if doc != nil {
-					for _, cmt := range doc.List {
-						if strings.HasPrefix(cmt.Text, "//go:cgo_export_") {
-							// (1.6) packages use functions exported to cgo
-							g.use(mObj, nil, edgeCgoExported)
-						}
-					}
-				}
-			}
-			g.function(m)
-		case *ir.Type:
-			g.see(m.Object())
-			if m.Object().Exported() {
-				// (1.1) packages use exported named types
-				g.use(m.Object(), nil, edgeExportedType)
-			}
-			g.typ(m.Type(), nil)
-		default:
-			panic(fmt.Sprintf("unreachable: %T", m))
-		}
-	}
-
-	// OPT(dh): can we find meaningful initial capacities for these slices?
-	var ifaces []*types.Interface
-	var notIfaces []types.Type
-
-	for t := range g.seenTypes {
-		switch t := t.(type) {
-		case *types.Interface:
-			// OPT(dh): (8.1) we only need interfaces that have unexported methods
-			ifaces = append(ifaces, t)
-		default:
-			if _, ok := t.Underlying().(*types.Interface); !ok {
-				notIfaces = append(notIfaces, t)
 			}
 		}
 	}
 
-	// (8.0) handle interfaces
-	for _, t := range notIfaces {
-		ms := pkg.IR.Prog.MethodSets.MethodSet(t)
-		for _, iface := range ifaces {
-			if sels, ok := Implements(t, iface, ms); ok {
-				for _, sel := range sels {
-					g.useMethod(t, sel, t, edgeImplements)
-				}
-			}
-		}
+	for _, named := range g.namedTypes {
+		// OPT(dh): do we already have the method set available?
+		processMethodSet(named, types.NewMethodSet(named.Type()))
+		processMethodSet(named, types.NewMethodSet(types.NewPointer(named.Type())))
+
 	}
 
 	type ignoredKey struct {
@@ -1220,7 +393,8 @@ func (g *graph) entry(pkg *pkg) {
 		line int
 	}
 	ignores := map[ignoredKey]struct{}{}
-	for _, dir := range pkg.Directives {
+	directives := pass.ResultOf[directives.Analyzer].([]lint.Directive)
+	for _, dir := range directives {
 		if dir.Command != "ignore" && dir.Command != "file-ignore" {
 			continue
 		}
@@ -1229,7 +403,7 @@ func (g *graph) entry(pkg *pkg) {
 		}
 		for _, check := range strings.Split(dir.Arguments[0], ",") {
 			if check == "U1000" {
-				pos := pkg.Fset.PositionFor(dir.Node.Pos(), false)
+				pos := pass.Fset.PositionFor(dir.Node.Pos(), false)
 				var key ignoredKey
 				switch dir.Command {
 				case "ignore":
@@ -1253,45 +427,42 @@ func (g *graph) entry(pkg *pkg) {
 	if len(ignores) > 0 {
 		// all objects annotated with a //lint:ignore U1000 are considered used
 		for obj := range g.Nodes {
-			if obj, ok := obj.(types.Object); ok {
-				pos := pkg.Fset.PositionFor(obj.Pos(), false)
-				key1 := ignoredKey{
-					pos.Filename,
-					pos.Line,
-				}
-				key2 := ignoredKey{
-					pos.Filename,
-					-1,
-				}
-				_, ok := ignores[key1]
-				if !ok {
-					_, ok = ignores[key2]
-				}
-				if ok {
-					g.use(obj, nil, edgeIgnored)
+			pos := pass.Fset.PositionFor(obj.Pos(), false)
+			key1 := ignoredKey{
+				pos.Filename,
+				pos.Line,
+			}
+			key2 := ignoredKey{
+				pos.Filename,
+				-1,
+			}
+			_, ok := ignores[key1]
+			if !ok {
+				_, ok = ignores[key2]
+			}
+			if ok {
+				g.use(obj, nil)
 
-					// use methods and fields of ignored types
-					if obj, ok := obj.(*types.TypeName); ok {
-						if obj.IsAlias() {
-							if typ, ok := obj.Type().(*types.Named); ok && typ.Obj().Pkg() != obj.Pkg() {
-								// This is an alias of a named type in another package.
-								// Don't walk its fields or methods; we don't have to,
-								// and it breaks an assertion in graph.use because we're using an object that we haven't seen before.
-								//
-								// For aliases to types in the same package, we do want to ignore the fields and methods,
-								// because ignoring the alias should ignore the aliased type.
-								continue
-							}
+				// use methods and fields of ignored types
+				if obj, ok := obj.(*types.TypeName); ok {
+					if obj.IsAlias() {
+						if typ, ok := obj.Type().(*types.Named); ok && typ.Obj().Pkg() != obj.Pkg() {
+							// This is an alias of a named type in another package.
+							// Don't walk its fields or methods; we don't have to.
+							//
+							// For aliases to types in the same package, we do want to ignore the fields and methods,
+							// because ignoring the alias should ignore the aliased type.
+							continue
 						}
-						if typ, ok := obj.Type().(*types.Named); ok {
-							for i := 0; i < typ.NumMethods(); i++ {
-								g.use(typ.Method(i), nil, edgeIgnored)
-							}
+					}
+					if typ, ok := obj.Type().(*types.Named); ok {
+						for i := 0; i < typ.NumMethods(); i++ {
+							g.use(typ.Method(i), nil)
 						}
-						if typ, ok := obj.Type().Underlying().(*types.Struct); ok {
-							for i := 0; i < typ.NumFields(); i++ {
-								g.use(typ.Field(i), nil, edgeIgnored)
-							}
+					}
+					if typ, ok := obj.Type().Underlying().(*types.Struct); ok {
+						for i := 0; i < typ.NumFields(); i++ {
+							g.use(typ.Field(i), nil)
 						}
 					}
 				}
@@ -1300,507 +471,767 @@ func (g *graph) entry(pkg *pkg) {
 	}
 }
 
-func (g *graph) useMethod(t types.Type, sel *types.Selection, by interface{}, kind EdgeKind) {
-	obj := sel.Obj().(*types.Func)
-	path := sel.Index()
-	assert(obj != nil)
-	if len(path) > 1 {
-		base := typeutil.Dereference(t).Underlying().(*types.Struct)
-		for _, idx := range path[:len(path)-1] {
-			next := base.Field(idx)
-			// (6.3) structs use embedded fields that help implement interfaces
-			g.see(base)
-			g.seeAndUse(next, base, edgeProvidesMethod)
-			base, _ = typeutil.Dereference(next.Type()).Underlying().(*types.Struct)
+func isOfType[T any](x any) bool {
+	_, ok := x.(T)
+	return ok
+}
+
+func (g *graph) read(node ast.Node, by types.Object) {
+	if node == nil {
+		return
+	}
+
+	switch node := node.(type) {
+	case *ast.Ident:
+		// XXX this branch, in the end, handles all uses of objects
+		// (7.2) field accesses use fields
+
+		obj := g.pass.TypesInfo.ObjectOf(node)
+		g.use(obj, by)
+
+	case *ast.BasicLit:
+		// Nothing to do
+
+	case *ast.SliceExpr:
+		g.read(node.X, by)
+		g.read(node.Low, by)
+		g.read(node.High, by)
+		g.read(node.Max, by)
+
+	case *ast.UnaryExpr:
+		g.read(node.X, by)
+
+	case *ast.ParenExpr:
+		g.read(node.X, by)
+
+	case *ast.ArrayType:
+		g.read(node.Len, by)
+		g.read(node.Elt, by)
+
+	case *ast.SelectorExpr:
+		g.readSelectorExpr(node, by)
+
+	case *ast.IndexExpr:
+		g.read(node.X, by)
+		g.read(node.Index, by)
+
+	case *ast.BinaryExpr:
+		g.read(node.X, by)
+		g.read(node.Y, by)
+
+	case *ast.CompositeLit:
+		g.read(node.Type, by)
+		// We get the type of the node itself, not of node.Type, to handle nested composite literals of the kind
+		// T{{...}}
+		typ, isStruct := typeutil.CoreType(g.pass.TypesInfo.TypeOf(node)).(*types.Struct)
+
+		if isStruct && len(node.Elts) != 0 && !isOfType[*ast.KeyValueExpr](node.Elts[0]) {
+			// Untagged struct literal that specifies all fields
+			for i := 0; i < typ.NumFields(); i++ {
+				g.use(typ.Field(i), by)
+			}
 		}
-	}
-	g.seeAndUse(obj, by, kind)
-}
+		for _, elt := range node.Elts {
+			g.read(elt, by)
+		}
 
-func owningObject(fn *ir.Function) types.Object {
-	if fn.Object() != nil {
-		return fn.Object()
-	}
-	if fn.Parent() != nil {
-		return owningObject(fn.Parent())
-	}
-	return nil
-}
+	case *ast.KeyValueExpr:
+		g.read(node.Key, by)
+		g.read(node.Value, by)
 
-func (g *graph) function(fn *ir.Function) {
-	assert(fn != nil)
-	if fn.Package() != nil && fn.Package() != g.pkg.IR {
-		return
-	}
+	case *ast.StarExpr:
+		g.read(node.X, by)
 
-	if _, ok := g.seenFns[fn]; ok {
-		return
-	}
-	g.seenFns[fn] = struct{}{}
+	case *ast.MapType:
+		g.read(node.Key, by)
+		g.read(node.Value, by)
 
-	// (4.1) functions use all their arguments, return parameters and receivers
-	g.signature(fn.Signature, owningObject(fn))
-	g.instructions(fn)
-	for _, anon := range fn.AnonFuncs {
-		// (4.2) functions use anonymous functions defined beneath them
-		//
-		// This fact is expressed implicitly. Anonymous functions have
-		// no types.Object, so their owner is the surrounding
-		// function.
-		g.function(anon)
-	}
-}
+	case *ast.FuncLit:
+		g.read(node.Type, by)
+		g.block(node.Body, by)
 
-func (g *graph) typ(t types.Type, parent types.Type) {
-	if _, ok := g.seenTypes[t]; ok {
-		return
-	}
+	case *ast.FuncType:
+		// (4.1) functions use all their arguments, return parameters and receivers
+		// (12.1) type parameters use their constraint type
+		g.read(node.TypeParams, by)
+		g.read(node.Params, by)
+		g.read(node.Results, by)
 
-	if t, ok := t.(*types.Named); ok && t.Obj().Pkg() != nil {
-		if t.Obj().Pkg() != g.pkg.Pkg {
+	case *ast.FieldList:
+		if node == nil {
 			return
 		}
-	}
 
-	g.seenTypes[t] = struct{}{}
-	if IsIrrelevant(t) {
+		// This branch is only hit for field lists enclosed by parentheses or square brackets, i.e. parameters. Fields
+		// (for structs) and method lists (for interfaces) are handled elsewhere.
+
+		for _, field := range node.List {
+			if len(field.Names) == 0 {
+				g.read(field.Type, by)
+			} else {
+				for _, name := range field.Names {
+					// OPT(dh): instead of by -> name -> type, we could just emit by -> type. We don't care about the
+					// (un)usedness of parameters of any kind.
+					obj := g.pass.TypesInfo.ObjectOf(name)
+					g.see(obj, by)
+					g.use(obj, by)
+					g.read(field.Type, obj)
+				}
+			}
+		}
+
+	case *ast.ChanType:
+		g.read(node.Value, by)
+
+	case *ast.StructType:
+		// This is only used for anonymous struct types, not named ones.
+
+		for _, field := range node.Fields.List {
+			if len(field.Names) == 0 {
+				// embedded field
+
+				f := g.embeddedField(field.Type)
+				g.use(f, by)
+			} else {
+				for _, name := range field.Names {
+					// (11.1) anonymous struct types use all their fields
+					// OPT(dh): instead of by -> name -> type, we could just emit by -> type. If the type is used, then the fields are used.
+					obj := g.pass.TypesInfo.ObjectOf(name)
+					g.see(obj, by)
+					g.use(obj, by)
+					g.read(field.Type, g.pass.TypesInfo.ObjectOf(name))
+				}
+			}
+		}
+
+	case *ast.TypeAssertExpr:
+		g.read(node.X, by)
+		g.read(node.Type, by)
+
+	case *ast.InterfaceType:
+		if len(node.Methods.List) != 0 {
+			g.interfaceTypes = append(g.interfaceTypes, g.pass.TypesInfo.TypeOf(node).(*types.Interface))
+		}
+		for _, meth := range node.Methods.List {
+			switch len(meth.Names) {
+			case 0:
+				// Embedded type or type union
+				// (8.4) all embedded interfaces are marked as used
+				// (this also covers type sets)
+
+				g.read(meth.Type, by)
+			case 1:
+				// Method
+				// (8.3) all interface methods are marked as used
+				obj := g.pass.TypesInfo.ObjectOf(meth.Names[0])
+				g.see(obj, by)
+				g.use(obj, by)
+				g.read(meth.Type, obj)
+			default:
+				panic(fmt.Sprintf("unexpected number of names: %d", len(meth.Names)))
+			}
+		}
+
+	case *ast.Ellipsis:
+		g.read(node.Elt, by)
+
+	case *ast.CallExpr:
+		g.read(node.Fun, by)
+		for _, arg := range node.Args {
+			g.read(arg, by)
+		}
+
+		// Handle conversiosn
+		conv := node
+		if len(conv.Args) != 1 || conv.Ellipsis.IsValid() {
+			return
+		}
+
+		dst := g.pass.TypesInfo.TypeOf(conv.Fun)
+		src := g.pass.TypesInfo.TypeOf(conv.Args[0])
+
+		// XXX use DereferenceR instead
+		// XXX guard against infinite recursion in DereferenceR
+		tSrc := typeutil.CoreType(typeutil.Dereference(src))
+		tDst := typeutil.CoreType(typeutil.Dereference(dst))
+		stSrc, okSrc := tSrc.(*types.Struct)
+		stDst, okDst := tDst.(*types.Struct)
+		if okDst && okSrc {
+			// Converting between two structs. The fields are
+			// relevant for the conversion, but only if the
+			// fields are also used outside of the conversion.
+			// Mark fields as used by each other.
+
+			assert(stDst.NumFields() == stSrc.NumFields())
+			for i := 0; i < stDst.NumFields(); i++ {
+				// (5.1) when converting between two equivalent structs, the fields in
+				// either struct use each other. the fields are relevant for the
+				// conversion, but only if the fields are also accessed outside the
+				// conversion.
+				g.use(stDst.Field(i), stSrc.Field(i))
+				g.use(stSrc.Field(i), stDst.Field(i))
+			}
+		} else if okSrc && tDst == types.Typ[types.UnsafePointer] {
+			// (5.2) when converting to or from unsafe.Pointer, mark all fields as used.
+			for i := 0; i < stSrc.NumFields(); i++ {
+				g.use(stSrc.Field(i), by)
+			}
+		} else if okDst && tSrc == types.Typ[types.UnsafePointer] {
+			// (5.2) when converting to or from unsafe.Pointer, mark all fields as used.
+			for i := 0; i < stDst.NumFields(); i++ {
+				g.use(stDst.Field(i), by)
+			}
+		}
+
+	default:
+		lint.ExhaustiveTypeSwitch(node)
+	}
+}
+
+func (g *graph) write(node ast.Node, by types.Object) {
+	if node == nil {
 		return
 	}
 
-	g.see(t)
-	switch t := t.(type) {
-	case *types.Struct:
-		for i := 0; i < t.NumFields(); i++ {
-			g.see(t.Field(i))
-			if t.Field(i).Exported() {
-				// (6.2) structs use exported fields
-				g.use(t.Field(i), t, edgeExportedField)
-			} else if t.Field(i).Name() == "_" {
-				g.use(t.Field(i), t, edgeBlankField)
-			} else if IsNoCopyType(t.Field(i).Type()) {
-				// (6.1) structs use fields of type NoCopy sentinel
-				g.use(t.Field(i), t, edgeNoCopySentinel)
-			} else if parent == nil {
-				// (11.1) anonymous struct types use all their fields.
-				g.use(t.Field(i), t, edgeAnonymousStruct)
+	switch node := node.(type) {
+	case *ast.Ident:
+		obj := g.pass.TypesInfo.ObjectOf(node)
+		if obj == nil {
+			// This can happen for `switch x := v.(type)`, where that x doesn't have an object
+			return
+		}
+		// g.see(obj)
+
+		// (4.9) functions use package-level variables they assign to iff in tests (sinks for benchmarks)
+		// (9.7) variable _reads_ use variables, writes do not, except in tests
+		path := g.pass.Fset.File(obj.Pos()).Name()
+		if strings.HasSuffix(path, "_test.go") {
+			if isGlobal(obj) {
+				g.use(obj, by)
 			}
-			if t.Field(i).Anonymous() {
-				// does the embedded field contribute exported methods to the method set?
-				T := t.Field(i).Type()
-				if _, ok := T.Underlying().(*types.Pointer); !ok {
-					// An embedded field is addressable, so check
-					// the pointer type to get the full method set
-					T = g.newPointer(T)
-				}
-				ms := g.pkg.IR.Prog.MethodSets.MethodSet(T)
-				for j := 0; j < ms.Len(); j++ {
-					if ms.At(j).Obj().Exported() {
-						// (6.4) structs use embedded fields that have exported methods (recursively)
-						g.use(t.Field(i), t, edgeExtendsExportedMethodSet)
-						break
+		}
+
+	case *ast.IndexExpr:
+		g.read(node.X, by)
+
+	case *ast.SelectorExpr:
+		g.readSelectorExpr(node, by)
+
+	case *ast.StarExpr:
+		g.read(node.X, by)
+
+	default:
+		lint.ExhaustiveTypeSwitch(node)
+	}
+}
+
+// readSelectorExpr reads all elements of a selector expression, including implicit fields.
+func (g *graph) readSelectorExpr(sel *ast.SelectorExpr, by types.Object) {
+	// cover AST-based accesses
+	g.read(sel.X, by)
+
+	tsel, ok := g.pass.TypesInfo.Selections[sel]
+	if !ok {
+		return
+	}
+	g.readSelection(tsel, by)
+}
+
+func (g *graph) readSelection(sel *types.Selection, by types.Object) {
+	indices := sel.Index()
+	base := sel.Recv()
+	for _, idx := range indices[:len(indices)-1] {
+		// XXX do we need core types here?
+		field := typeutil.Dereference(base.Underlying()).Underlying().(*types.Struct).Field(idx)
+		g.use(field, by)
+		base = field.Type()
+	}
+
+	g.use(sel.Obj(), by)
+}
+
+func (g *graph) block(block *ast.BlockStmt, by types.Object) {
+	if block == nil {
+		return
+	}
+
+	for _, stmt := range block.List {
+		g.stmt(stmt, by)
+	}
+}
+
+func isGlobal(obj types.Object) bool {
+	return obj.Parent() == obj.Pkg().Scope()
+}
+
+func (g *graph) decl(decl ast.Decl, by types.Object) {
+	switch decl := decl.(type) {
+	case *ast.GenDecl:
+		switch decl.Tok {
+		case token.IMPORT:
+			// Nothing to do
+
+		case token.CONST:
+			for _, spec := range decl.Specs {
+				vspec := spec.(*ast.ValueSpec)
+				assert(len(vspec.Values) == 0 || len(vspec.Values) == len(vspec.Names))
+				for i, name := range vspec.Names {
+					obj := g.pass.TypesInfo.ObjectOf(name)
+					g.see(obj, by)
+					g.read(vspec.Type, obj)
+
+					if len(vspec.Values) != 0 {
+						g.read(vspec.Values[i], obj)
 					}
+
+					if name.Name == "_" {
+						// (9.9) objects named the blank identifier are used
+						g.use(obj, by)
+					} else if token.IsExported(name.Name) && isGlobal(obj) {
+						g.use(obj, nil)
+					}
+				}
+			}
+
+			groups := astutil.GroupSpecs(g.pass.Fset, decl.Specs)
+			for _, group := range groups {
+				// (10.1) if one constant out of a block of constants is used, mark all of them used
+				//
+				// We encode this as a ring. If we have a constant group 'const ( a; b; c )', then we'll produce the
+				// following graph: a -> b -> c -> a.
+
+				var first, prev, last types.Object
+				for _, spec := range group {
+					for _, name := range spec.(*ast.ValueSpec).Names {
+						if name.Name == "_" {
+							// Having a blank constant in a group doesn't mark the whole group as used
+							continue
+						}
+
+						obj := g.pass.TypesInfo.ObjectOf(name)
+						if first == nil {
+							first = obj
+						} else {
+							g.use(obj, prev)
+						}
+						prev = obj
+						last = obj
+					}
+				}
+				if first != nil && first != last {
+					g.use(first, last)
+				}
+			}
+
+		case token.TYPE:
+			for _, spec := range decl.Specs {
+				tspec := spec.(*ast.TypeSpec)
+				obj := g.pass.TypesInfo.ObjectOf(tspec.Name).(*types.TypeName)
+				g.see(obj, by)
+				if !tspec.Assign.IsValid() {
+					g.namedTypes = append(g.namedTypes, obj)
+				}
+				if token.IsExported(tspec.Name.Name) && isGlobal(obj) {
+					// (1.1) packages use exported named types
+					g.use(g.pass.TypesInfo.ObjectOf(tspec.Name), nil)
 				}
 
-				seen := map[*types.Struct]struct{}{}
-				var hasExportedField func(t types.Type) bool
-				hasExportedField = func(T types.Type) bool {
-					t, ok := typeutil.Dereference(T).Underlying().(*types.Struct)
-					if !ok {
-						return false
-					}
-					if _, ok := seen[t]; ok {
-						return false
-					}
-					seen[t] = struct{}{}
-					for i := 0; i < t.NumFields(); i++ {
-						field := t.Field(i)
-						if field.Exported() {
-							return true
+				// (2.5) named types use all their type parameters
+				g.read(tspec.TypeParams, obj)
+
+				g.namedType(obj, tspec.Type)
+
+				if tspec.Name.Name == "_" {
+					// (9.9) objects named the blank identifier are used
+					g.use(obj, by)
+				}
+			}
+
+		case token.VAR:
+			// We cannot rely on types.Initializer for package-level variables because
+			// - initializers are only tracked for variables that are actually initialized
+			// - we want to see the AST of the type, if specified, not just the rhs
+
+			for _, spec := range decl.Specs {
+				vspec := spec.(*ast.ValueSpec)
+				for i, name := range vspec.Names {
+					obj := g.pass.TypesInfo.ObjectOf(name)
+					g.see(obj, by)
+					// variables and constants use their types
+					g.read(vspec.Type, obj)
+
+					if len(vspec.Names) == len(vspec.Values) {
+						// One value per variable
+						g.read(vspec.Values[i], obj)
+					} else if len(vspec.Values) != 0 {
+						// Multiple variables initialized with a single rhs
+						// assert(len(vspec.Values) == 1)
+						if len(vspec.Values) != 1 {
+							panic(g.pass.Fset.PositionFor(vspec.Pos(), false))
 						}
-						if field.Embedded() && hasExportedField(field.Type()) {
-							return true
-						}
+						g.read(vspec.Values[0], obj)
 					}
+
+					if token.IsExported(name.Name) && isGlobal(obj) {
+						// (1.3) packages use exported variables
+						g.use(obj, nil)
+					}
+
+					if name.Name == "_" {
+						// (9.9) objects named the blank identifier are used
+						g.use(obj, by)
+					}
+				}
+			}
+
+		default:
+			panic(fmt.Sprintf("unexpected token %s", decl.Tok))
+		}
+
+	case *ast.FuncDecl:
+		// XXX calling OriginMethod is unnecessary if we use types.Func.Origin
+		obj := typeparams.OriginMethod(g.pass.TypesInfo.ObjectOf(decl.Name).(*types.Func))
+		g.see(obj, by)
+
+		if token.IsExported(decl.Name.Name) {
+			if decl.Recv == nil {
+				// (1.2) packages use exported functions
+				g.use(obj, nil)
+			}
+		} else if decl.Name.Name == "init" {
+			// (1.5) packages use init functions
+			g.use(obj, nil)
+		} else if decl.Name.Name == "main" && g.pass.Pkg.Name() == "main" {
+			// (1.7) packages use the main function iff in the main package
+			g.use(obj, nil)
+		} else if g.pass.Pkg.Path() == "runtime" && runtimeFuncs[decl.Name.Name] {
+			// (9.8) runtime functions that may be called from user code via the compiler
+			g.use(obj, nil)
+		}
+
+		// (4.1) functions use their receivers
+		g.read(decl.Recv, obj)
+		g.read(decl.Type, obj)
+		g.block(decl.Body, obj)
+
+		if decl.Name.Name == "_" {
+			// (9.9) objects named the blank identifier are used
+			g.use(obj, nil)
+		}
+
+		if decl.Doc != nil {
+			for _, cmt := range decl.Doc.List {
+				if strings.HasPrefix(cmt.Text, "//go:cgo_export_") {
+					// (1.6) packages use functions exported to cgo
+					g.use(obj, nil)
+				}
+			}
+		}
+
+	default:
+		// We do not cover BadDecl, but we shouldn't ever see one of those
+		lint.ExhaustiveTypeSwitch(decl)
+	}
+}
+
+func (g *graph) stmt(stmt ast.Stmt, by types.Object) {
+	if stmt == nil {
+		return
+	}
+
+	for {
+		// We don't care about labels, so unwrap LabeledStmts. Note that a label can itself be labeled.
+		if labeled, ok := stmt.(*ast.LabeledStmt); ok {
+			stmt = labeled.Stmt
+		} else {
+			break
+		}
+	}
+
+	switch stmt := stmt.(type) {
+	case *ast.AssignStmt:
+		if stmt.Tok == token.DEFINE {
+			for _, lhs := range stmt.Lhs {
+				obj := g.pass.TypesInfo.ObjectOf(lhs.(*ast.Ident))
+				// obj can be nil for `switch x := v.(type)`, where that x doesn't have an object
+				if obj != nil {
+					defer func() {
+						if err := recover(); err != nil {
+							panic(g.pass.Fset.PositionFor(stmt.Pos(), false))
+						}
+					}()
+					g.see(obj, by)
+				}
+			}
+		}
+		for _, lhs := range stmt.Lhs {
+			g.write(lhs, by)
+		}
+		for _, rhs := range stmt.Rhs {
+			// Note: it would be more accurate to have the rhs used by the lhs, but it ultimately doesn't matter,
+			// because local variables are always end up used, anyway.
+			g.read(rhs, by)
+		}
+
+	case *ast.BlockStmt:
+		g.block(stmt, by)
+
+	case *ast.BranchStmt:
+		// Nothing to do
+
+	case *ast.DeclStmt:
+		g.decl(stmt.Decl, by)
+
+	case *ast.DeferStmt:
+		g.read(stmt.Call, by)
+
+	case *ast.ExprStmt:
+		g.read(stmt.X, by)
+
+	case *ast.ForStmt:
+		g.stmt(stmt.Init, by)
+		g.read(stmt.Cond, by)
+		g.stmt(stmt.Post, by)
+		g.block(stmt.Body, by)
+
+	case *ast.GoStmt:
+		g.read(stmt.Call, by)
+
+	case *ast.IfStmt:
+		g.stmt(stmt.Init, by)
+		g.read(stmt.Cond, by)
+		g.block(stmt.Body, by)
+		g.stmt(stmt.Else, by)
+
+	case *ast.IncDecStmt:
+		// Increment/decrement have no effect on the usedness of an object.
+
+	case *ast.RangeStmt:
+		g.write(stmt.Key, by)
+		g.write(stmt.Value, by)
+		g.read(stmt.X, by)
+		g.block(stmt.Body, by)
+
+	case *ast.ReturnStmt:
+		for _, ret := range stmt.Results {
+			g.read(ret, by)
+		}
+
+	case *ast.SelectStmt:
+		for _, clause_ := range stmt.Body.List {
+			clause := clause_.(*ast.CommClause)
+			switch comm := clause.Comm.(type) {
+			case *ast.SendStmt:
+				g.read(comm.Chan, by)
+				g.read(comm.Value, by)
+			case *ast.ExprStmt:
+				g.read(comm.X.(*ast.UnaryExpr).X, by)
+			case *ast.AssignStmt:
+				for _, lhs := range comm.Lhs {
+					g.write(lhs, by)
+				}
+				for _, rhs := range comm.Rhs {
+					g.read(rhs, by)
+				}
+			case nil:
+			default:
+				lint.ExhaustiveTypeSwitch(comm)
+			}
+			for _, body := range clause.Body {
+				g.stmt(body, by)
+			}
+		}
+
+	case *ast.SendStmt:
+		g.read(stmt.Chan, by)
+		g.read(stmt.Value, by)
+
+	case *ast.SwitchStmt:
+		g.stmt(stmt.Init, by)
+		g.read(stmt.Tag, by)
+		for _, clause_ := range stmt.Body.List {
+			clause := clause_.(*ast.CaseClause)
+			for _, expr := range clause.List {
+				g.read(expr, by)
+			}
+			for _, body := range clause.Body {
+				g.stmt(body, by)
+			}
+		}
+
+	case *ast.TypeSwitchStmt:
+		g.stmt(stmt.Init, by)
+		g.stmt(stmt.Assign, by)
+		for _, clause_ := range stmt.Body.List {
+			clause := clause_.(*ast.CaseClause)
+			for _, expr := range clause.List {
+				g.read(expr, by)
+			}
+			for _, body := range clause.Body {
+				g.stmt(body, by)
+			}
+		}
+
+	case *ast.EmptyStmt:
+		// Nothing to do
+
+	default:
+		lint.ExhaustiveTypeSwitch(stmt)
+	}
+}
+
+// embeddedField sees the field declared by the embedded field node, and marks the type as used by the field.
+//
+// Embedded fields are special in two ways: they don't have names, so we don't have immediate access to an ast.Ident to
+// resolve to the field's types.Var, and we cannot use g.read on the type because eventually we do get to an ast.Ident,
+// and ObjectOf resolves embedded fields to the field they declare, not the type. That's why we have code specially for
+// handling embedded fields.
+func (g *graph) embeddedField(node ast.Node) *types.Var {
+	// We need to traverse the tree to find the ast.Ident, but all the nodes we traverse should be used by the object we
+	// get once we resolve the ident. Collect the nodes and process them once we've found the ident.
+	nodes := make([]ast.Node, 0, 4)
+	for {
+		switch node_ := node.(type) {
+		case *ast.Ident:
+			obj := g.pass.TypesInfo.ObjectOf(node_).(*types.Var)
+			for _, n := range nodes {
+				g.read(n, obj)
+			}
+			switch typ := typeutil.Dereference(g.pass.TypesInfo.TypeOf(node_)).(type) {
+			case *types.Named:
+				g.use(typ.Obj(), obj)
+			case *types.Basic:
+				// Nothing to do
+			default:
+				lint.ExhaustiveTypeSwitch(typ)
+			}
+			return obj
+		case *ast.StarExpr:
+			node = node_.X
+		case *ast.SelectorExpr:
+			node = node_.Sel
+			nodes = append(nodes, node_.X)
+		case *ast.IndexExpr:
+			node = node_.X
+			nodes = append(nodes, node_.Index)
+		case *ast.IndexListExpr:
+			node = node_.X
+		default:
+			lint.ExhaustiveTypeSwitch(node_)
+		}
+	}
+}
+
+func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
+	// (2.2) named types use the type they're based on
+
+	if st, ok := spec.(*ast.StructType); ok {
+		// Named structs are special in that its unexported fields are only used if they're being written to. That is,
+		// the fields are not used by the named type itself, nor are the types of the fields.
+		for _, field := range st.Fields.List {
+			seen := map[*types.Struct]struct{}{}
+			// For `type x struct { *x; F int }`, don't visit the embedded x
+			seen[g.pass.TypesInfo.TypeOf(st).(*types.Struct)] = struct{}{}
+			var hasExportedField func(t types.Type) bool
+			hasExportedField = func(T types.Type) bool {
+				t, ok := typeutil.Dereference(T).Underlying().(*types.Struct)
+				if !ok {
 					return false
 				}
-				// does the embedded field contribute exported fields?
-				if hasExportedField(t.Field(i).Type()) {
+				if _, ok := seen[t]; ok {
+					return false
+				}
+				seen[t] = struct{}{}
+				for i := 0; i < t.NumFields(); i++ {
+					field := t.Field(i)
+					if field.Exported() {
+						return true
+					}
+					if field.Embedded() && hasExportedField(field.Type()) {
+						return true
+					}
+				}
+				return false
+			}
+
+			if len(field.Names) == 0 {
+				fieldVar := g.embeddedField(field.Type)
+				if hasExportedField(fieldVar.Type()) {
 					// (6.5) structs use embedded structs that have exported fields (recursively)
-					g.use(t.Field(i), t, edgeExtendsExportedFields)
+					g.use(fieldVar, typ)
 				}
+			} else {
+				for _, name := range field.Names {
+					obj := g.pass.TypesInfo.ObjectOf(name)
+					g.see(obj, typ)
+					// (7.2) fields use their types
+					g.read(field.Type, obj)
+					if name.Name == "_" {
+						// (9.9) objects named the blank identifier are used
+						g.use(obj, typ)
+					} else if token.IsExported(name.Name) {
+						// (6.2) structs use exported fields
+						g.use(obj, typ)
+					}
 
+					if isNoCopyType(obj.Type()) {
+						// (6.1) structs use fields of type NoCopy sentinel
+						g.use(obj, typ)
+					}
+				}
 			}
-			g.variable(t.Field(i))
-		}
-	case *types.Basic:
-		// Nothing to do
-	case *types.Named:
-		// (9.3) types use their underlying and element types
-		origin := t.Origin()
-		g.seeAndUse(origin.Underlying(), t, edgeUnderlyingType)
-		g.seeAndUse(t.Obj(), t, edgeTypeName)
-		g.seeAndUse(t, t.Obj(), edgeNamedType)
 
-		// (2.4) named types use the pointer type
-		if _, ok := t.Underlying().(*types.Interface); !ok && t.NumMethods() > 0 {
-			g.seeAndUse(g.newPointer(origin), t, edgePointerType)
 		}
-
-		// (2.5) named types use their type parameters
-
-		for i := 0; i < t.TypeParams().Len(); i++ {
-			tparam := t.TypeParams().At(i)
-			g.seeAndUse(tparam, t, edgeTypeParam)
-			g.typ(tparam, nil)
-		}
-
-		// (2.6) named types use their type arguments
-		for i := 0; i < t.TypeArgs().Len(); i++ {
-			targ := t.TypeArgs().At(i)
-			g.seeAndUse(targ, t, edgeTypeArg)
-			g.typ(t, nil)
-		}
-
-		for i := 0; i < t.NumMethods(); i++ {
-			g.see(t.Method(i))
-			// don't use trackExportedIdentifier here, we care about
-			// all exported methods, even in package main or in tests.
-			if t.Method(i).Exported() {
-				// (2.1) named types use exported methods
-				g.use(t.Method(i), t, edgeExportedMethod)
-			}
-			g.function(g.pkg.IR.Prog.FuncValue(t.Method(i)))
-		}
-
-		g.typ(origin.Underlying(), t)
-	case *types.Slice:
-		// (9.3) types use their underlying and element types
-		g.seeAndUse(t.Elem(), t, edgeElementType)
-		g.typ(t.Elem(), nil)
-	case *types.Map:
-		// (9.3) types use their underlying and element types
-		g.seeAndUse(t.Elem(), t, edgeElementType)
-		// (9.3) types use their underlying and element types
-		g.seeAndUse(t.Key(), t, edgeKeyType)
-		g.typ(t.Elem(), nil)
-		g.typ(t.Key(), nil)
-	case *types.Signature:
-		g.signature(t, nil)
-	case *types.Interface:
-		for i := 0; i < t.NumMethods(); i++ {
-			m := t.Method(i)
-			// (8.3) All interface methods are marked as used
-			g.seeAndUse(m, t, edgeInterfaceMethod)
-			g.seeAndUse(m.Type().(*types.Signature), m, edgeSignature)
-			g.signature(m.Type().(*types.Signature), nil)
-		}
-		for i := 0; i < t.NumEmbeddeds(); i++ {
-			tt := t.EmbeddedType(i)
-			// (8.4) All embedded interfaces are marked as used
-			g.typ(tt, nil)
-			g.seeAndUse(tt, t, edgeEmbeddedInterface)
-		}
-	case *types.Array:
-		// (9.3) types use their underlying and element types
-		g.seeAndUse(t.Elem(), t, edgeElementType)
-		g.typ(t.Elem(), nil)
-	case *types.Pointer:
-		// (9.3) types use their underlying and element types
-		g.seeAndUse(t.Elem(), t, edgeElementType)
-		g.typ(t.Elem(), nil)
-	case *types.Chan:
-		// (9.3) types use their underlying and element types
-		g.seeAndUse(t.Elem(), t, edgeElementType)
-		g.typ(t.Elem(), nil)
-	case *types.Tuple:
-		for i := 0; i < t.Len(); i++ {
-			// (9.3) types use their underlying and element types
-			g.seeAndUse(t.At(i).Type(), t, edgeTupleElement|edgeType)
-			g.typ(t.At(i).Type(), nil)
-		}
-	case *typeutil.Iterator:
-		// (9.3) types use their underlying and element types
-		g.seeAndUse(t.Elem(), t, edgeElementType)
-		g.typ(t.Elem(), nil)
-	case *types.TypeParam:
-		// (9.3) types use their underlying and element types
-
-		g.seeAndUse(t.Obj(), t, edgeTypeName)
-		g.seeAndUse(t, t.Obj(), edgeNamedType)
-		g.seeAndUse(t.Constraint(), t, edgeElementType)
-		g.typ(t.Constraint(), t)
-	case *types.Union:
-		for i := 0; i < t.Len(); i++ {
-			g.seeAndUse(t.Term(i).Type(), t, edgeUnionTerm)
-			g.typ(t.Term(i).Type(), nil)
-		}
-	default:
-		panic(fmt.Sprintf("unreachable: %T", t))
+	} else {
+		g.read(spec, typ)
 	}
 }
 
-func (g *graph) variable(v *types.Var) {
-	// (9.2) variables use their types
-	g.seeAndUse(v.Type(), v, edgeType)
-	g.typ(v.Type(), nil)
-}
+func (g *graph) results() (used, unused []types.Object) {
+	g.color(g.Root)
 
-func (g *graph) signature(sig *types.Signature, fn types.Object) {
-	var user interface{} = fn
-	if fn == nil {
-		user = sig
-		g.see(sig)
-	}
-	if sig.Recv() != nil {
-		g.seeAndUse(sig.Recv().Type(), user, edgeReceiver|edgeType)
-		g.typ(sig.Recv().Type(), nil)
-	}
-	for i := 0; i < sig.Params().Len(); i++ {
-		param := sig.Params().At(i)
-		g.seeAndUse(param.Type(), user, edgeFunctionArgument|edgeType)
-		g.typ(param.Type(), nil)
-	}
-	for i := 0; i < sig.Results().Len(); i++ {
-		param := sig.Results().At(i)
-		g.seeAndUse(param.Type(), user, edgeFunctionResult|edgeType)
-		g.typ(param.Type(), nil)
-	}
-	for i := 0; i < sig.RecvTypeParams().Len(); i++ {
-		// We track the type parameter's constraint, not the type parameter itself.
-		// We never want to flag an unused type parameter.
-		param := sig.RecvTypeParams().At(i).Constraint()
-		g.seeAndUse(param, user, edgeFunctionArgument|edgeType)
-		g.typ(param, nil)
-	}
-	for i := 0; i < sig.TypeParams().Len(); i++ {
-		// We track the type parameter's constraint, not the type parameter itself.
-		// We never want to flag an unused type parameter.
-		param := sig.TypeParams().At(i).Constraint()
-		g.seeAndUse(param, user, edgeFunctionArgument|edgeType)
-		g.typ(param, nil)
-	}
-}
-
-func (g *graph) instructions(fn *ir.Function) {
-	fnObj := owningObject(fn)
-	for _, b := range fn.Blocks {
-		for _, instr := range b.Instrs {
-			ops := instr.Operands(nil)
-			switch instr.(type) {
-			case *ir.Store:
-				// (9.7) variable _reads_ use variables, writes do not
-				ops = ops[1:]
-			case *ir.DebugRef:
-				ops = nil
-			}
-			for _, arg := range ops {
-				walkPhi(*arg, func(v ir.Value) {
-					switch v := v.(type) {
-					case *ir.Function:
-						// (4.3) functions use closures and bound methods.
-						// (4.5) functions use functions they call
-						// (9.5) instructions use their operands
-						// (4.4) functions use functions they return. we assume that someone else will call the returned function
-						if owningObject(v) != nil {
-							g.seeAndUse(owningObject(v), fnObj, edgeInstructionOperand)
-						}
-						g.function(v)
-					case *ir.Const:
-						// (9.6) instructions use their operands' types
-						g.seeAndUse(v.Type(), fnObj, edgeType)
-						g.typ(v.Type(), nil)
-					case *ir.Global:
-						if v.Object() != nil {
-							// (9.5) instructions use their operands
-							g.seeAndUse(v.Object(), fnObj, edgeInstructionOperand)
-						}
-					}
-				})
-			}
-			if v, ok := instr.(ir.Value); ok {
-				if _, ok := v.(*ir.Range); !ok {
-					// See https://github.com/golang/go/issues/19670
-
-					// (4.8) instructions use their types
-					// (9.4) conversions use the type they convert to
-					g.seeAndUse(v.Type(), fnObj, edgeType)
-					g.typ(v.Type(), nil)
-				}
-			}
-			switch instr := instr.(type) {
-			case *ir.Field:
-				// Can't access fields via generics, for now.
-
-				st := instr.X.Type().Underlying().(*types.Struct)
-				field := st.Field(instr.Field)
-				// (4.7) functions use fields they access
-				g.seeAndUse(field, fnObj, edgeFieldAccess)
-			case *ir.FieldAddr:
-				// User code can't access fields on type parameters, but composite literals are still possible, which
-				// compile to FieldAddr + Store.
-
-				st := typeutil.CoreType(typeutil.Dereference(instr.X.Type())).(*types.Struct)
-				field := st.Field(instr.Field)
-				// (4.7) functions use fields they access
-				g.seeAndUse(field, fnObj, edgeFieldAccess)
-			case *ir.Store:
-				// nothing to do, handled generically by operands
-			case ir.CallInstruction:
-				c := instr.Common()
-				for _, targ := range c.TypeArgs {
-					g.seeAndUse(targ, fnObj, edgeTypeArg)
-				}
-				if !c.IsInvoke() {
-					// handled generically as an instruction operand
-				} else {
-					// (4.5) functions use functions/interface methods they call
-					g.seeAndUse(c.Method, fnObj, edgeInterfaceCall)
-				}
-			case *ir.Return:
-				// nothing to do, handled generically by operands
-			case *ir.ChangeType:
-				// conversion type handled generically
-
-				// TODO should this use DereferenceR instead?
-				s1, ok1 := typeutil.CoreType(typeutil.Dereference(instr.Type())).(*types.Struct)
-				s2, ok2 := typeutil.CoreType(typeutil.Dereference(instr.X.Type())).(*types.Struct)
-				if ok1 && ok2 {
-					// Converting between two structs. The fields are
-					// relevant for the conversion, but only if the
-					// fields are also used outside of the conversion.
-					// Mark fields as used by each other.
-
-					assert(s1.NumFields() == s2.NumFields())
-					for i := 0; i < s1.NumFields(); i++ {
-						g.see(s1.Field(i))
-						g.see(s2.Field(i))
-						// (5.1) when converting between two equivalent structs, the fields in
-						// either struct use each other. the fields are relevant for the
-						// conversion, but only if the fields are also accessed outside the
-						// conversion.
-						g.seeAndUse(s1.Field(i), s2.Field(i), edgeStructConversion)
-						g.seeAndUse(s2.Field(i), s1.Field(i), edgeStructConversion)
-					}
-				}
-			case *ir.MakeInterface:
-				// nothing to do, handled generically by operands
-			case *ir.Slice:
-				// nothing to do, handled generically by operands
-			case *ir.RunDefers:
-				// nothing to do, the deferred functions are already marked use by deferring them.
-			case *ir.Convert:
-				// to unsafe.Pointer
-				if typ, ok := instr.Type().(*types.Basic); ok && typ.Kind() == types.UnsafePointer {
-					if ptr, ok := instr.X.Type().Underlying().(*types.Pointer); ok {
-						if st, ok := ptr.Elem().Underlying().(*types.Struct); ok {
-							for i := 0; i < st.NumFields(); i++ {
-								// (5.2) when converting to or from unsafe.Pointer, mark all fields as used.
-								g.seeAndUse(st.Field(i), fnObj, edgeUnsafeConversion)
-							}
-						}
-					}
-				}
-				// from unsafe.Pointer
-				if typ, ok := instr.X.Type().(*types.Basic); ok && typ.Kind() == types.UnsafePointer {
-					if ptr, ok := instr.Type().Underlying().(*types.Pointer); ok {
-						if st, ok := ptr.Elem().Underlying().(*types.Struct); ok {
-							for i := 0; i < st.NumFields(); i++ {
-								// (5.2) when converting to or from unsafe.Pointer, mark all fields as used.
-								g.seeAndUse(st.Field(i), fnObj, edgeUnsafeConversion)
-							}
-						}
-					}
-				}
-			case *ir.TypeAssert:
-				// nothing to do, handled generically by instruction
-				// type (possibly a tuple, which contains the asserted
-				// to type). redundantly handled by the type of
-				// ir.Extract, too
-			case *ir.MakeClosure:
-				// nothing to do, handled generically by operands
-			case *ir.Alloc:
-				// nothing to do
-			case *ir.UnOp:
-				// nothing to do
-			case *ir.BinOp:
-				// nothing to do
-			case *ir.If:
-				// nothing to do
-			case *ir.Jump:
-				// nothing to do
-			case *ir.Unreachable:
-				// nothing to do
-			case *ir.IndexAddr:
-				// nothing to do
-			case *ir.Extract:
-				// nothing to do
-			case *ir.Panic:
-				// nothing to do
-			case *ir.DebugRef:
-				// nothing to do
-			case *ir.BlankStore:
-				// nothing to do
-			case *ir.Phi:
-				// nothing to do
-			case *ir.Sigma:
-				// nothing to do
-			case *ir.MakeMap:
-				// nothing to do
-			case *ir.MapUpdate:
-				// nothing to do
-			case *ir.MapLookup:
-				// nothing to do
-			case *ir.StringLookup:
-				// nothing to do
-			case *ir.MakeSlice:
-				// nothing to do
-			case *ir.Send:
-				// nothing to do
-			case *ir.MakeChan:
-				// nothing to do
-			case *ir.Range:
-				// nothing to do
-			case *ir.Next:
-				// nothing to do
-			case *ir.Index:
-				// nothing to do
-			case *ir.Select:
-				// nothing to do
-			case *ir.ChangeInterface:
-				// nothing to do
-			case *ir.Load:
-				// nothing to do
-			case *ir.Parameter:
-				// nothing to do
-			case *ir.Const:
-				// nothing to do
-			case *ir.ArrayConst:
-				// nothing to do
-			case *ir.AggregateConst:
-				// nothing to do
-			case *ir.GenericConst:
-				// nothing to do
-			case *ir.Recv:
-				// nothing to do
-			case *ir.TypeSwitch:
-				// nothing to do
-			case *ir.ConstantSwitch:
-				// nothing to do
-			case *ir.SliceToArrayPointer:
-				// nothing to do
-			case *ir.CompositeValue:
-				if t, ok := typeutil.CoreType(instr.Type()).(*types.Struct); ok {
-					for i := 0; i < len(instr.Values); i++ {
-						if instr.Bitmap.Bit(i) == 1 {
-							g.seeAndUse(t.Field(i), fnObj, edgeFieldAccess)
-						}
-					}
-				}
-			default:
-				lint.ExhaustiveTypeSwitch(instr)
-			}
+	var quieten func(n *node)
+	quieten = func(n *node) {
+		n.quiet = true
+		for _, owned := range n.owns {
+			quieten(owned)
 		}
 	}
+
+	for _, n := range g.Nodes {
+		if n.seen {
+			continue
+		}
+		for _, owned := range n.owns {
+			quieten(owned)
+		}
+	}
+
+	// OPT(dh): can we find meaningful initial capacities for the used and unused slices?
+	for _, n := range g.Nodes {
+		switch obj := n.obj.(type) {
+		case *types.Var:
+			if obj.Name() == "" && obj.IsField() {
+				// don't report unnamed variables (interface embedding)
+				continue
+			}
+			if !obj.IsField() && obj.Parent() != obj.Pkg().Scope() {
+				// Skip local variables, they're always used
+				continue
+			}
+		}
+
+		if n.obj.Pkg() != g.pass.Pkg {
+			continue
+		}
+		if n.seen {
+			used = append(used, n.obj)
+		} else if !n.quiet {
+			unused = append(unused, n.obj)
+		}
+	}
+
+	return used, unused
 }
 
 // IsNoCopyType reports whether a type represents the NoCopy sentinel
@@ -1809,7 +1240,7 @@ func (g *graph) instructions(fn *ir.Function) {
 //
 // FIXME(dh): currently we're not checking that the function body is
 // empty.
-func IsNoCopyType(typ types.Type) bool {
+func isNoCopyType(typ types.Type) bool {
 	st, ok := typ.Underlying().(*types.Struct)
 	if !ok {
 		return false
@@ -1834,29 +1265,4 @@ func IsNoCopyType(typ types.Type) bool {
 		return false
 	}
 	return true
-}
-
-func walkPhi(v ir.Value, fn func(v ir.Value)) {
-	phi, ok := v.(*ir.Phi)
-	if !ok {
-		fn(v)
-		return
-	}
-
-	seen := map[ir.Value]struct{}{}
-	var impl func(v *ir.Phi)
-	impl = func(v *ir.Phi) {
-		if _, ok := seen[v]; ok {
-			return
-		}
-		seen[v] = struct{}{}
-		for _, e := range v.Edges {
-			if ev, ok := e.(*ir.Phi); ok {
-				impl(ev)
-			} else {
-				fn(e)
-			}
-		}
-	}
-	impl(phi)
 }

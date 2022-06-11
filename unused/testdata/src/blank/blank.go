@@ -27,6 +27,6 @@ func init() { //@ used(true)
 	fn2()
 }
 
-func _() {}
+func _() {} //@ used(true)
 
-type _ struct{}
+type _ struct{} //@ used(true)
