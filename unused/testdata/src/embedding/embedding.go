@@ -93,3 +93,12 @@ type t12 struct { //@ used(true)
 }
 
 var _ = t12{}
+
+// embedded fields whose names are exported are used, same as normal exported fields.
+type T13 struct { //@ used(true)
+	T14  //@ used(true)
+	*T15 //@ used(true)
+}
+
+type T14 struct{} //@ used(true)
+type T15 struct{} //@ used(true)

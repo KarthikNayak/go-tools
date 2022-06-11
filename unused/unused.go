@@ -18,6 +18,8 @@ import (
 	"honnef.co/go/tools/go/types/typeutil"
 )
 
+// XXX vet that all functions handle ParenExpr correctly
+
 var Debug io.Writer
 
 // TODO(dh): we cannot observe function calls in assembly files.
@@ -700,7 +702,6 @@ func (g *graph) write(node ast.Node, by types.Object) {
 			// This can happen for `switch x := v.(type)`, where that x doesn't have an object
 			return
 		}
-		// g.see(obj)
 
 		// (4.9) functions use package-level variables they assign to iff in tests (sinks for benchmarks)
 		// (9.7) variable _reads_ use variables, writes do not, except in tests
@@ -713,12 +714,20 @@ func (g *graph) write(node ast.Node, by types.Object) {
 
 	case *ast.IndexExpr:
 		g.read(node.X, by)
+		g.read(node.Index, by)
 
 	case *ast.SelectorExpr:
+		// Writing to a field constitutes a use. See https://staticcheck.io/issues/288 for some discussion on that.
+		//
+		// This code can also get triggered by qualified package variables, in which case it doesn't matter what we do,
+		// because the object is in another package.
 		g.readSelectorExpr(node, by)
 
 	case *ast.StarExpr:
 		g.read(node.X, by)
+
+	case *ast.ParenExpr:
+		g.write(node.X, by)
 
 	default:
 		lint.ExhaustiveTypeSwitch(node)
@@ -1004,7 +1013,9 @@ func (g *graph) stmt(stmt ast.Stmt, by types.Object) {
 		g.stmt(stmt.Else, by)
 
 	case *ast.IncDecStmt:
-		// Increment/decrement have no effect on the usedness of an object.
+		// We treat post-increment as a write only. This ends up using fields and sinks in tests, but not other
+		// variables.
+		g.write(stmt.X, by)
 
 	case *ast.RangeStmt:
 		g.write(stmt.Key, by)
@@ -1156,6 +1167,10 @@ func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
 
 			if len(field.Names) == 0 {
 				fieldVar := g.embeddedField(field.Type)
+				if token.IsExported(fieldVar.Name()) {
+					// (6.2) structs use exported fields
+					g.use(fieldVar, typ)
+				}
 				if hasExportedField(fieldVar.Type()) {
 					// (6.5) structs use embedded structs that have exported fields (recursively)
 					g.use(fieldVar, typ)
