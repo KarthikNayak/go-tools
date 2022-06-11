@@ -22,9 +22,18 @@ import (
 
 // XXX vet that all functions handle ParenExpr correctly
 
-var Debug io.Writer
+// TODO(dh): currently, types use methods that implement interfaces. However, this makes a method used even if the
+// relevant interface is never used. What if instead interfaces used those methods? Right now we cannot do that, because
+// methods use their receivers, so using a method uses the type. But do we need that edge? Is there a way to refer to a
+// method without explicitly mentioning the type somewhere? If not, the edge from method to receiver is superfluous.
+
+// XXX improve tests to not only check for used/unused, but also for quiet
+
+// XXX vet all code for proper use of core types
 
 // TODO(dh): we cannot observe function calls in assembly files.
+
+var Debug io.Writer
 
 /*
 
@@ -131,15 +140,6 @@ var Debug io.Writer
 
 */
 
-// TODO(dh): currently, types use methods that implement interfaces. However, this makes a method used even if the
-// relevant interface is never used. What if instead interfaces used those methods? Right now we cannot do that, because
-// methods use their receivers, so using a method uses the type. But do we need that edge? Is there a way to refer to a
-// method without explicitly mentioning the type somewhere? If not, the edge from method to receiver is superfluous.
-
-// XXX improve tests to not only check for used/unused, but also for quiet
-
-// XXX vet all code for proper use of core types
-
 func debugf(f string, v ...interface{}) {
 	if Debug != nil {
 		fmt.Fprintf(Debug, f, v...)
@@ -180,8 +180,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	g.entry(pass)
 	used, unused := g.results()
 
-	if true {
-		// XXX make debug printing conditional
+	if Debug != nil {
 		debugNode := func(n *node) {
 			if n.obj == nil {
 				debugf("n%d [label=\"Root\"];\n", n.id)
@@ -213,6 +212,53 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	}
 
 	return Result{Used: used, Unused: unused}, nil
+}
+
+func (g *graph) results() (used, unused []types.Object) {
+	g.color(g.Root)
+
+	var quieten func(n *node)
+	quieten = func(n *node) {
+		n.quiet = true
+		for _, owned := range n.owns {
+			quieten(owned)
+		}
+	}
+
+	for _, n := range g.Nodes {
+		if n.seen {
+			continue
+		}
+		for _, owned := range n.owns {
+			quieten(owned)
+		}
+	}
+
+	// OPT(dh): can we find meaningful initial capacities for the used and unused slices?
+	for _, n := range g.Nodes {
+		switch obj := n.obj.(type) {
+		case *types.Var:
+			if obj.Name() == "" && obj.IsField() {
+				// don't report unnamed variables (interface embedding)
+				continue
+			}
+			if !obj.IsField() && obj.Parent() != obj.Pkg().Scope() {
+				// Skip local variables, they're always used
+				continue
+			}
+		}
+
+		if n.obj.Pkg() != g.pass.Pkg {
+			continue
+		}
+		if n.seen {
+			used = append(used, n.obj)
+		} else if !n.quiet {
+			unused = append(unused, n.obj)
+		}
+	}
+
+	return used, unused
 }
 
 type graph struct {
@@ -1202,53 +1248,6 @@ func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
 	} else {
 		g.read(spec, typ)
 	}
-}
-
-func (g *graph) results() (used, unused []types.Object) {
-	g.color(g.Root)
-
-	var quieten func(n *node)
-	quieten = func(n *node) {
-		n.quiet = true
-		for _, owned := range n.owns {
-			quieten(owned)
-		}
-	}
-
-	for _, n := range g.Nodes {
-		if n.seen {
-			continue
-		}
-		for _, owned := range n.owns {
-			quieten(owned)
-		}
-	}
-
-	// OPT(dh): can we find meaningful initial capacities for the used and unused slices?
-	for _, n := range g.Nodes {
-		switch obj := n.obj.(type) {
-		case *types.Var:
-			if obj.Name() == "" && obj.IsField() {
-				// don't report unnamed variables (interface embedding)
-				continue
-			}
-			if !obj.IsField() && obj.Parent() != obj.Pkg().Scope() {
-				// Skip local variables, they're always used
-				continue
-			}
-		}
-
-		if n.obj.Pkg() != g.pass.Pkg {
-			continue
-		}
-		if n.seen {
-			used = append(used, n.obj)
-		} else if !n.quiet {
-			unused = append(unused, n.obj)
-		}
-	}
-
-	return used, unused
 }
 
 // IsNoCopyType reports whether a type represents the NoCopy sentinel
