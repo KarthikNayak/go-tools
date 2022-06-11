@@ -1,3 +1,4 @@
+// Package unused contains code for finding unused code.
 package unused
 
 import (
@@ -9,13 +10,14 @@ import (
 	"reflect"
 	"strings"
 
-	"golang.org/x/exp/typeparams"
-	"golang.org/x/tools/go/analysis"
 	"honnef.co/go/tools/analysis/facts/directives"
 	"honnef.co/go/tools/analysis/facts/generated"
 	"honnef.co/go/tools/analysis/lint"
 	"honnef.co/go/tools/go/ast/astutil"
 	"honnef.co/go/tools/go/types/typeutil"
+
+	"golang.org/x/exp/typeparams"
+	"golang.org/x/tools/go/analysis"
 )
 
 // XXX vet that all functions handle ParenExpr correctly
